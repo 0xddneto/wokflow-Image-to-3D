@@ -37,6 +37,13 @@ roda no navegador sem servidor, token ou GPU dedicada.
 - Saída volumétrica: 52.961 voxels individuais em 12 partes.
 - GLB exportado: 9.209.288 bytes.
 - Frente, perfil e vista 3/4 verificadas no navegador.
+
+## Editor de pixels
+
+- Clique seleciona diretamente um pixel do modelo, sem expor grupos anatômicos na interface.
+- `Shift + clique` adiciona ou remove pixels da seleção.
+- `Ctrl + A`, Todos, Inverter, Limpar e `Esc` controlam a seleção.
+- Cor, movimento X/Y/Z, restauração e exclusão são aplicados a um, vários ou todos os pixels selecionados.
 - Build e testes do site aprovados.
 
 ## Próximas melhorias locais

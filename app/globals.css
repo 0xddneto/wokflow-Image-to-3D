@@ -499,6 +499,64 @@ input[type="range"]::-webkit-slider-thumb {
   font-weight: 520;
 }
 
+.selection-instruction {
+  margin: 0 0 14px;
+  color: #8d98a4;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.selection-instruction strong {
+  color: var(--paper);
+  font-weight: 600;
+}
+
+.selection-toolbar {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+
+.selection-toolbar button {
+  min-height: 34px;
+  border: 1px solid #2b3540;
+  background: #131920;
+  color: #a7b1bb;
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.selection-toolbar button:hover {
+  border-color: var(--acid);
+  color: var(--acid);
+}
+
+.selection-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid rgba(168, 255, 207, 0.28);
+  background: rgba(168, 255, 207, 0.055);
+}
+
+.selection-summary strong {
+  color: var(--acid);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 18px;
+}
+
+.selection-summary span {
+  color: #8b98a4;
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.pixel-selection-editor {
+  min-height: 205px;
+}
+
 .part-list {
   display: grid;
   gap: 5px;
@@ -640,6 +698,11 @@ input[type="range"]::-webkit-slider-thumb {
 
 .part-actions button {
   justify-content: center;
+}
+
+.part-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .part-actions .danger-action {

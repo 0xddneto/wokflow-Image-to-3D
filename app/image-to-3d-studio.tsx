@@ -2,8 +2,6 @@
 
 import {
   Download,
-  Eye,
-  EyeOff,
   Grid3X3,
   Move3D,
   Palette,
@@ -46,14 +44,6 @@ type PartId =
   | "left-foot"
   | "right-foot";
 
-type PartSummary = {
-  id: PartId;
-  label: string;
-  visible: boolean;
-  voxels: number;
-  position: [number, number, number];
-};
-
 type PixelSample = {
   x: number;
   y: number;
@@ -62,7 +52,7 @@ type PixelSample = {
   blue: number;
 };
 
-type SelectedVoxel = {
+type SelectedPixel = {
   partId: PartId;
   instanceId: number;
 };
@@ -397,6 +387,7 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
     mesh.userData.cell = cell;
     mesh.userData.originalMatrices = [] as number[][];
     mesh.userData.originalColors = [] as number[][];
+    mesh.userData.currentColors = [] as number[][];
     mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
@@ -433,6 +424,7 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
       mesh.setColorAt(index, color);
       mesh.userData.originalMatrices.push(matrix.toArray());
       mesh.userData.originalColors.push(color.toArray());
+      mesh.userData.currentColors.push(color.toArray());
     });
     mesh.instanceMatrix.needsUpdate = true;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
@@ -475,20 +467,6 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
   };
 }
 
-function summarizeParts(model: THREE.Group): PartSummary[] {
-  return model.children.flatMap((child) => {
-    const id = child.userData.partId as PartId | undefined;
-    if (!id) return [];
-    return [{
-      id,
-      label: String(child.userData.label ?? id),
-      visible: child.visible,
-      voxels: Number(child.userData.voxels ?? 0),
-      position: [child.position.x, child.position.y, child.position.z] as [number, number, number],
-    }];
-  });
-}
-
 function disposeObject(object: THREE.Object3D) {
   object.traverse((child) => {
     if (!(child instanceof THREE.Mesh)) return;
@@ -520,11 +498,8 @@ export function ImageTo3DStudio() {
   const [status, setStatus] = useState("Preparando exemplo…");
   const [dragging, setDragging] = useState(false);
   const [exporting, setExporting] = useState(false);
-  const [parts, setParts] = useState<PartSummary[]>([]);
-  const [selectedPartId, setSelectedPartId] = useState<PartId | null>(null);
-  const [selectedVoxel, setSelectedVoxel] = useState<SelectedVoxel | null>(null);
-  const [partColor, setPartColor] = useState("#ffffff");
-  const [voxelColor, setVoxelColor] = useState("#ffffff");
+  const [selectedPixels, setSelectedPixels] = useState<SelectedPixel[]>([]);
+  const [selectionColor, setSelectionColor] = useState("#ffffff");
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -617,14 +592,22 @@ export function ImageTo3DStudio() {
       const hit = raycaster.intersectObject(root, true)[0];
       let target: THREE.Object3D | null = hit?.object ?? null;
       while (target && !target.userData.partId) target = target.parent;
-      if (target?.userData.partId) {
+      if (target?.userData.partId && hit?.object instanceof THREE.InstancedMesh && hit.instanceId !== undefined) {
         const partId = target.userData.partId as PartId;
-        setSelectedPartId(partId);
-        if (hit?.object instanceof THREE.InstancedMesh && hit.instanceId !== undefined) {
-          setSelectedVoxel({ partId, instanceId: hit.instanceId });
-        } else {
-          setSelectedVoxel(null);
-        }
+        const clicked = { partId, instanceId: hit.instanceId } satisfies SelectedPixel;
+        setSelectedPixels((previous) => {
+          if (!event.shiftKey) return [clicked];
+          const exists = previous.some(
+            (pixel) => pixel.partId === clicked.partId && pixel.instanceId === clicked.instanceId,
+          );
+          return exists
+            ? previous.filter(
+              (pixel) => pixel.partId !== clicked.partId || pixel.instanceId !== clicked.instanceId,
+            )
+            : [...previous, clicked];
+        });
+      } else if (!event.shiftKey) {
+        setSelectedPixels([]);
       }
     };
     canvas.addEventListener("pointerup", selectFromCanvas);
@@ -691,20 +674,15 @@ export function ImageTo3DStudio() {
         root.add(result.group);
         root.rotation.set(0, 0, 0);
         setMetrics(result.metrics);
-        const nextParts = summarizeParts(result.group);
-        setParts(nextParts);
-        setSelectedPartId(nextParts[0]?.id ?? null);
-        setSelectedVoxel(null);
-        setPartColor("#ffffff");
+        setSelectedPixels([]);
+        setSelectionColor("#ffffff");
         setActiveView("front");
         setStatus(
           `${result.metrics.sourcePixels.toLocaleString("pt-BR")} pixels preservados · ${result.metrics.elements.toLocaleString("pt-BR")} voxels 3D`,
         );
       } catch (error) {
         setMetrics(EMPTY_METRICS);
-        setParts([]);
-        setSelectedPartId(null);
-        setSelectedVoxel(null);
+        setSelectedPixels([]);
         setStatus(error instanceof Error ? error.message : "Falha na geração");
       }
     }, 100);
@@ -750,137 +728,148 @@ export function ImageTo3DStudio() {
     spinRef.current = next;
   };
 
-  const getPartGroup = useCallback((partId: PartId | null) => {
-    const model = rootRef.current?.children[0];
-    if (!model || !partId) return null;
-    return model.getObjectByName(`part:${partId}`) as THREE.Group | null;
-  }, []);
+  const previousSelectionRef = useRef<SelectedPixel[]>([]);
 
-  const getPartVoxelMesh = useCallback((partId: PartId | null) => {
-    const group = getPartGroup(partId);
+  const getPixelMesh = useCallback((partId: PartId) => {
+    const model = rootRef.current?.children[0];
+    const group = model?.getObjectByName(`part:${partId}`);
     const mesh = group?.children.find((child) => child instanceof THREE.InstancedMesh);
     return mesh instanceof THREE.InstancedMesh ? mesh : null;
-  }, [getPartGroup]);
-
-  const refreshParts = useCallback(() => {
-    const model = rootRef.current?.children[0];
-    if (model instanceof THREE.Group) setParts(summarizeParts(model));
   }, []);
 
-  useEffect(() => {
-    const model = rootRef.current?.children[0];
-    if (!model) return;
-    model.traverse((object) => {
-      if (!(object instanceof THREE.Mesh)) return;
-      const material = object.material;
-      if (!(material instanceof THREE.MeshStandardMaterial)) return;
-      material.emissive.set(0x000000);
-      material.emissiveIntensity = 0;
+  const getEveryPixel = useCallback(() => {
+    const result: SelectedPixel[] = [];
+    rootRef.current?.children[0]?.traverse((object) => {
+      if (!(object instanceof THREE.InstancedMesh)) return;
+      const partId = object.userData.partId as PartId | undefined;
+      if (!partId) return;
+      for (let instanceId = 0; instanceId < object.count; instanceId += 1) {
+        result.push({ partId, instanceId });
+      }
     });
-  }, [selectedPartId, parts]);
+    return result;
+  }, []);
 
-  const selectedPart = parts.find((part) => part.id === selectedPartId) ?? null;
-
-  const togglePartVisibility = useCallback((partId: PartId) => {
-    const group = getPartGroup(partId);
-    if (!group) return;
-    group.visible = !group.visible;
-    refreshParts();
-  }, [getPartGroup, refreshParts]);
-
-  const recolorPart = useCallback((hex: string) => {
-    setPartColor(hex);
-    const mesh = getPartVoxelMesh(selectedPartId);
-    if (!mesh) return;
-    const color = new THREE.Color(hex);
-    for (let index = 0; index < mesh.count; index += 1) mesh.setColorAt(index, color);
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  }, [getPartVoxelMesh, selectedPartId]);
-
-  const restorePartColors = useCallback(() => {
-    const mesh = getPartVoxelMesh(selectedPartId);
-    const originals = mesh?.userData.originalColors as number[][] | undefined;
-    if (!mesh || !originals) return;
+  const renderSelection = useCallback((pixels: SelectedPixel[], highlighted: boolean) => {
+    const dirty = new Set<THREE.InstancedMesh>();
+    const highlight = new THREE.Color("#54ffb0");
     const color = new THREE.Color();
-    originals.forEach((values, index) => {
+    for (const pixel of pixels) {
+      const mesh = getPixelMesh(pixel.partId);
+      const currentColors = mesh?.userData.currentColors as number[][] | undefined;
+      const values = currentColors?.[pixel.instanceId];
+      if (!mesh || !values) continue;
       color.fromArray(values);
-      mesh.setColorAt(index, color);
+      if (highlighted) color.lerp(highlight, 0.58);
+      mesh.setColorAt(pixel.instanceId, color);
+      dirty.add(mesh);
+    }
+    dirty.forEach((mesh) => {
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     });
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-    setPartColor("#ffffff");
-  }, [getPartVoxelMesh, selectedPartId]);
+  }, [getPixelMesh]);
 
   useEffect(() => {
-    const mesh = getPartVoxelMesh(selectedVoxel?.partId ?? null);
-    if (!mesh || selectedVoxel === null) return;
-    const color = new THREE.Color();
-    mesh.getColorAt(selectedVoxel.instanceId, color);
-    setVoxelColor(`#${color.getHexString()}`);
-  }, [getPartVoxelMesh, selectedVoxel]);
+    renderSelection(previousSelectionRef.current, false);
+    renderSelection(selectedPixels, true);
+    previousSelectionRef.current = selectedPixels;
+    const last = selectedPixels.at(-1);
+    const colors = last ? getPixelMesh(last.partId)?.userData.currentColors as number[][] | undefined : undefined;
+    const values = last ? colors?.[last.instanceId] : undefined;
+    if (values) setSelectionColor(`#${new THREE.Color().fromArray(values).getHexString(THREE.SRGBColorSpace)}`);
+  }, [getPixelMesh, renderSelection, selectedPixels]);
 
-  const recolorVoxel = useCallback((hex: string) => {
-    setVoxelColor(hex);
-    const mesh = getPartVoxelMesh(selectedVoxel?.partId ?? null);
-    if (!mesh || selectedVoxel === null) return;
-    mesh.setColorAt(selectedVoxel.instanceId, new THREE.Color(hex));
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  }, [getPartVoxelMesh, selectedVoxel]);
+  const selectAllPixels = useCallback(() => setSelectedPixels(getEveryPixel()), [getEveryPixel]);
+  const clearSelection = useCallback(() => setSelectedPixels([]), []);
+  const invertSelection = useCallback(() => {
+    setSelectedPixels((current) => {
+      const selected = new Set(current.map((pixel) => `${pixel.partId}:${pixel.instanceId}`));
+      return getEveryPixel().filter((pixel) => !selected.has(`${pixel.partId}:${pixel.instanceId}`));
+    });
+  }, [getEveryPixel]);
 
-  const nudgeVoxel = useCallback((axis: "x" | "y" | "z", direction: -1 | 1) => {
-    const mesh = getPartVoxelMesh(selectedVoxel?.partId ?? null);
-    if (!mesh || selectedVoxel === null) return;
-    const matrix = new THREE.Matrix4();
-    const position = new THREE.Vector3();
-    const quaternion = new THREE.Quaternion();
-    const scale = new THREE.Vector3();
-    mesh.getMatrixAt(selectedVoxel.instanceId, matrix);
-    matrix.decompose(position, quaternion, scale);
-    position[axis] += Number(mesh.userData.cell ?? 0.08) * direction;
-    matrix.compose(position, quaternion, scale);
-    mesh.setMatrixAt(selectedVoxel.instanceId, matrix);
-    mesh.instanceMatrix.needsUpdate = true;
-  }, [getPartVoxelMesh, selectedVoxel]);
-
-  const restoreVoxel = useCallback(() => {
-    const mesh = getPartVoxelMesh(selectedVoxel?.partId ?? null);
-    const originals = mesh?.userData.originalMatrices as number[][] | undefined;
-    const colors = mesh?.userData.originalColors as number[][] | undefined;
-    if (!mesh || selectedVoxel === null || !originals?.[selectedVoxel.instanceId]) return;
-    mesh.setMatrixAt(selectedVoxel.instanceId, new THREE.Matrix4().fromArray(originals[selectedVoxel.instanceId]));
-    if (colors?.[selectedVoxel.instanceId]) {
-      mesh.setColorAt(selectedVoxel.instanceId, new THREE.Color().fromArray(colors[selectedVoxel.instanceId]));
-      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  const recolorSelection = useCallback((hex: string) => {
+    setSelectionColor(hex);
+    const color = new THREE.Color(hex);
+    for (const pixel of selectedPixels) {
+      const mesh = getPixelMesh(pixel.partId);
+      const currentColors = mesh?.userData.currentColors as number[][] | undefined;
+      if (!mesh || !currentColors) continue;
+      currentColors[pixel.instanceId] = color.toArray();
     }
-    mesh.instanceMatrix.needsUpdate = true;
-  }, [getPartVoxelMesh, selectedVoxel]);
+    renderSelection(selectedPixels, true);
+  }, [getPixelMesh, renderSelection, selectedPixels]);
 
-  const removeVoxel = useCallback(() => {
-    const mesh = getPartVoxelMesh(selectedVoxel?.partId ?? null);
-    if (!mesh || selectedVoxel === null) return;
+  const nudgeSelection = useCallback((axis: "x" | "y" | "z", direction: -1 | 1) => {
+    const dirty = new Set<THREE.InstancedMesh>();
     const matrix = new THREE.Matrix4();
     const position = new THREE.Vector3();
     const quaternion = new THREE.Quaternion();
     const scale = new THREE.Vector3();
-    mesh.getMatrixAt(selectedVoxel.instanceId, matrix);
-    matrix.decompose(position, quaternion, scale);
-    matrix.compose(position, quaternion, scale.setScalar(0));
-    mesh.setMatrixAt(selectedVoxel.instanceId, matrix);
-    mesh.instanceMatrix.needsUpdate = true;
-  }, [getPartVoxelMesh, selectedVoxel]);
+    for (const pixel of selectedPixels) {
+      const mesh = getPixelMesh(pixel.partId);
+      if (!mesh) continue;
+      mesh.getMatrixAt(pixel.instanceId, matrix);
+      matrix.decompose(position, quaternion, scale);
+      position[axis] += Number(mesh.userData.cell ?? 0.08) * direction;
+      matrix.compose(position, quaternion, scale);
+      mesh.setMatrixAt(pixel.instanceId, matrix);
+      dirty.add(mesh);
+    }
+    dirty.forEach((mesh) => { mesh.instanceMatrix.needsUpdate = true; });
+  }, [getPixelMesh, selectedPixels]);
 
-  const movePart = useCallback((axis: "x" | "y" | "z", value: number) => {
-    const group = getPartGroup(selectedPartId);
-    if (!group) return;
-    group.position[axis] = value;
-    refreshParts();
-  }, [getPartGroup, refreshParts, selectedPartId]);
+  const restoreSelection = useCallback(() => {
+    const dirty = new Set<THREE.InstancedMesh>();
+    for (const pixel of selectedPixels) {
+      const mesh = getPixelMesh(pixel.partId);
+      const matrices = mesh?.userData.originalMatrices as number[][] | undefined;
+      const originals = mesh?.userData.originalColors as number[][] | undefined;
+      const current = mesh?.userData.currentColors as number[][] | undefined;
+      if (!mesh || !matrices?.[pixel.instanceId] || !originals?.[pixel.instanceId] || !current) continue;
+      mesh.setMatrixAt(pixel.instanceId, new THREE.Matrix4().fromArray(matrices[pixel.instanceId]));
+      current[pixel.instanceId] = [...originals[pixel.instanceId]];
+      dirty.add(mesh);
+    }
+    dirty.forEach((mesh) => { mesh.instanceMatrix.needsUpdate = true; });
+    renderSelection(selectedPixels, true);
+  }, [getPixelMesh, renderSelection, selectedPixels]);
 
-  const resetPartTransform = useCallback(() => {
-    const group = getPartGroup(selectedPartId);
-    if (!group) return;
-    group.position.set(0, 0, 0);
-    refreshParts();
-  }, [getPartGroup, refreshParts, selectedPartId]);
+  const removeSelection = useCallback(() => {
+    const dirty = new Set<THREE.InstancedMesh>();
+    const matrix = new THREE.Matrix4();
+    const position = new THREE.Vector3();
+    const quaternion = new THREE.Quaternion();
+    const scale = new THREE.Vector3();
+    for (const pixel of selectedPixels) {
+      const mesh = getPixelMesh(pixel.partId);
+      if (!mesh) continue;
+      mesh.getMatrixAt(pixel.instanceId, matrix);
+      matrix.decompose(position, quaternion, scale);
+      matrix.compose(position, quaternion, scale.setScalar(0));
+      mesh.setMatrixAt(pixel.instanceId, matrix);
+      dirty.add(mesh);
+    }
+    dirty.forEach((mesh) => { mesh.instanceMatrix.needsUpdate = true; });
+  }, [getPixelMesh, selectedPixels]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.matches("input, textarea, select")) return;
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+        event.preventDefault();
+        selectAllPixels();
+      } else if (event.key === "Escape") {
+        clearSelection();
+      } else if (event.key === "Delete" || event.key === "Backspace") {
+        event.preventDefault();
+        removeSelection();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [clearSelection, removeSelection, selectAllPixels]);
 
   const exportGlb = useCallback(async () => {
     const source = rootRef.current?.children[0];
@@ -891,6 +880,14 @@ export function ImageTo3DStudio() {
       const exporter = new GLTFExporter();
       const asset = source.clone(true);
       asset.name = "ImageTo3D_Export";
+      asset.traverse((object) => {
+        if (!(object instanceof THREE.InstancedMesh)) return;
+        const colors = object.userData.currentColors as number[][] | undefined;
+        if (!colors) return;
+        const color = new THREE.Color();
+        colors.forEach((values, instanceId) => object.setColorAt(instanceId, color.fromArray(values)));
+        if (object.instanceColor) object.instanceColor.needsUpdate = true;
+      });
       const result = await exporter.parseAsync(asset, {
         binary: true,
         onlyVisible: true,
@@ -1063,133 +1060,74 @@ export function ImageTo3DStudio() {
         <aside className="inspector">
           <div>
             <div className="panel-heading">
-              <h2>Partes</h2>
+              <h2>Pixels</h2>
               <span className="step-number">03</span>
             </div>
-            <div className="part-list" aria-label="Partes editáveis do personagem">
-              {parts.map((part) => (
-                <div
-                  className={`part-row ${selectedPartId === part.id ? "is-selected" : ""}`}
-                  key={part.id}
-                >
-                  <button
-                    type="button"
-                    className="part-select"
-                    onClick={() => { setSelectedPartId(part.id); setSelectedVoxel(null); }}
-                  >
-                    <span>{part.label}</span>
-                    <small>{part.voxels.toLocaleString("pt-BR")} voxels</small>
-                  </button>
-                  <button
-                    type="button"
-                    className="visibility-button"
-                    aria-label={`${part.visible ? "Ocultar" : "Mostrar"} ${part.label}`}
-                    onClick={() => togglePartVisibility(part.id)}
-                  >
-                    {part.visible ? <Eye size={14} /> : <EyeOff size={14} />}
-                  </button>
-                </div>
-              ))}
+            <p className="selection-instruction">
+              Clique em qualquer pixel. Use <strong>Shift + clique</strong> para adicionar ou remover pixels da seleção.
+            </p>
+            <div className="selection-toolbar" aria-label="Comandos de seleção de pixels">
+              <button type="button" onClick={selectAllPixels}>Todos</button>
+              <button type="button" onClick={invertSelection}>Inverter</button>
+              <button type="button" onClick={clearSelection}>Limpar</button>
+            </div>
+            <div className="selection-summary" aria-live="polite">
+              <strong>{selectedPixels.length.toLocaleString("pt-BR")}</strong>
+              <span>{selectedPixels.length === 1 ? "pixel selecionado" : "pixels selecionados"}</span>
             </div>
           </div>
 
           <div className="divider" />
-          <div className="part-editor">
+          <div className="pixel-selection-editor">
             <div className="panel-heading">
-              <h3>{selectedPart?.label ?? "Selecione uma parte"}</h3>
+              <h3>Editar seleção</h3>
               <Move3D size={14} color="#a8ffcf" />
             </div>
-            {selectedPart ? (
+            {selectedPixels.length > 0 ? (
               <>
                 <div className="color-editor">
                   <label>
-                    <Palette size={14} /> Cor da parte
+                    <Palette size={14} /> Cor dos pixels
                     <input
                       type="color"
-                      value={partColor}
-                      onChange={(event) => recolorPart(event.target.value)}
+                      value={selectionColor}
+                      onChange={(event) => recolorSelection(event.target.value)}
                     />
                   </label>
-                  <button type="button" onClick={restorePartColors}>
+                  <button type="button" onClick={restoreSelection}>
                     <Undo2 size={13} /> Original
                   </button>
                 </div>
 
-                <div className="axis-editor">
-                  {(["x", "y", "z"] as const).map((axis, index) => (
-                    <label className="axis-row" key={axis}>
+                <div className="voxel-move" aria-label="Mover pixels selecionados">
+                  {(["x", "y", "z"] as const).map((axis) => (
+                    <div key={axis}>
                       <span>{axis.toUpperCase()}</span>
-                      <input
-                        type="range"
-                        min="-1.2"
-                        max="1.2"
-                        step="0.02"
-                        value={selectedPart.position[index]}
-                        onChange={(event) => movePart(axis, Number(event.target.value))}
-                      />
-                      <output>{selectedPart.position[index].toFixed(2)}</output>
-                    </label>
+                      <button type="button" aria-label={`Mover ${axis.toUpperCase()} negativo`} onClick={() => nudgeSelection(axis, -1)}>−</button>
+                      <button type="button" aria-label={`Mover ${axis.toUpperCase()} positivo`} onClick={() => nudgeSelection(axis, 1)}>+</button>
+                    </div>
                   ))}
                 </div>
 
                 <div className="part-actions">
-                  <button type="button" onClick={resetPartTransform}>
-                    <Undo2 size={13} /> Posição
+                  <button type="button" onClick={restoreSelection}>
+                    <Undo2 size={13} /> Restaurar
                   </button>
                   <button
                     type="button"
                     className="danger-action"
-                    onClick={() => togglePartVisibility(selectedPart.id)}
+                    onClick={removeSelection}
                   >
-                    <Trash2 size={13} /> Remover
+                    <Trash2 size={13} /> Apagar seleção
                   </button>
-                </div>
-
-                <div className="voxel-editor">
-                  <div className="voxel-heading">
-                    <strong>{selectedVoxel ? `Voxel #${selectedVoxel.instanceId + 1}` : "Edição por voxel"}</strong>
-                    <span>{selectedVoxel ? "selecionado" : "clique em um cubo"}</span>
-                  </div>
-                  {selectedVoxel ? (
-                    <>
-                      <label className="voxel-color">
-                        Cor individual
-                        <input
-                          type="color"
-                          value={voxelColor}
-                          onChange={(event) => recolorVoxel(event.target.value)}
-                        />
-                      </label>
-                      <div className="voxel-move" aria-label="Mover voxel selecionado">
-                        {(["x", "y", "z"] as const).map((axis) => (
-                          <div key={axis}>
-                            <span>{axis.toUpperCase()}</span>
-                            <button type="button" onClick={() => nudgeVoxel(axis, -1)}>−</button>
-                            <button type="button" onClick={() => nudgeVoxel(axis, 1)}>+</button>
-                          </div>
-                        ))}
-                      </div>
-                      <div className="part-actions">
-                        <button type="button" onClick={restoreVoxel}>
-                          <Undo2 size={13} /> Restaurar voxel
-                        </button>
-                        <button type="button" className="danger-action" onClick={removeVoxel}>
-                          <Trash2 size={13} /> Remover voxel
-                        </button>
-                      </div>
-                    </>
-                  ) : (
-                    <p className="empty-editor">Clique diretamente em um cubo do personagem.</p>
-                  )}
                 </div>
               </>
             ) : (
-              <p className="empty-editor">Clique em uma parte no modelo ou na lista.</p>
+              <p className="empty-editor">Selecione um ou mais pixels diretamente no personagem.</p>
             )}
           </div>
 
           <div className="compact-metrics">
-            <span>{metrics.parts} partes</span>
             <span>{(metrics.sourcePixels ?? 0).toLocaleString("pt-BR")} pixels frontais</span>
             <span>{metrics.elements.toLocaleString("pt-BR")} voxels</span>
             <span>{metrics.triangles.toLocaleString("pt-BR")} tris</span>
@@ -1198,8 +1136,7 @@ export function ImageTo3DStudio() {
           <div>
             <div className="divider" />
             <div className="editor-tip">
-              Clique em um cubo para editar aquele voxel. Cor, posição e
-              visibilidade são preservadas no GLB exportado.
+              Ctrl+A seleciona tudo · Shift+clique cria seleção múltipla · Delete apaga · Esc limpa a seleção.
             </div>
             <button
               className="export-button"
