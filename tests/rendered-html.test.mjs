@@ -34,7 +34,9 @@ test("server-renders the Image to 3D studio", async () => {
   const html = await response.text();
   assert.match(html, /<title>Image to 3D — Procedural Asset Studio<\/title>/i);
   assert.match(html, /Uma imagem entra/);
-  assert.match(html, /Pixel 3D/);
+  assert.match(html, /Blocos voxel/);
+  assert.match(html, /Partes/);
+  assert.match(html, /Selecione uma parte/);
   assert.match(html, /Exportar GLB/);
   assert.doesNotMatch(html, /codex-preview|SkeletonPreview|react-loading-skeleton/i);
 });
@@ -51,8 +53,11 @@ test("ships the canonical MOB example without coupling the tool to MOBs", async 
   assert.match(page, /ImageTo3DStudio/);
   assert.match(studio, /createProceduralAsset/);
   assert.match(studio, /GLTFExporter/);
-  assert.match(studio, /Pixel3D_Geometry/);
-  assert.match(studio, /SmoothRelief_Geometry/);
+  assert.match(studio, /ImageTo3D_EditableCharacter/);
+  assert.match(studio, /classifyCharacterPart/);
+  assert.match(studio, /togglePartVisibility/);
+  assert.match(studio, /recolorPart/);
+  assert.match(studio, /movePart/);
   assert.match(layout, /\/og\.png/);
   assert.match(packageJson, /"three"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);

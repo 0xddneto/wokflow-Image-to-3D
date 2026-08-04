@@ -1,15 +1,17 @@
 "use client";
 
 import {
-  Box,
-  CircleCheck,
   Download,
+  Eye,
+  EyeOff,
   Grid3X3,
-  Image as ImageIcon,
-  Layers3,
+  Move3D,
+  Palette,
   RotateCw,
   ShieldCheck,
   Sparkles,
+  Trash2,
+  Undo2,
   UploadCloud,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -27,7 +29,53 @@ type Metrics = {
   grid: string;
   elements: number;
   triangles: number;
+  parts: number;
 };
+
+type PartId =
+  | "head"
+  | "torso"
+  | "left-arm"
+  | "right-arm"
+  | "left-hand"
+  | "right-hand"
+  | "left-fingers"
+  | "right-fingers"
+  | "left-leg"
+  | "right-leg"
+  | "left-foot"
+  | "right-foot";
+
+type PartSummary = {
+  id: PartId;
+  label: string;
+  visible: boolean;
+  voxels: number;
+  position: [number, number, number];
+};
+
+type PixelSample = {
+  x: number;
+  y: number;
+  red: number;
+  green: number;
+  blue: number;
+};
+
+const PARTS: Array<{ id: PartId; label: string; depth: number }> = [
+  { id: "head", label: "Cabeça", depth: 1 },
+  { id: "torso", label: "Tronco", depth: 0.88 },
+  { id: "left-arm", label: "Braço E", depth: 0.58 },
+  { id: "right-arm", label: "Braço D", depth: 0.58 },
+  { id: "left-hand", label: "Mão E", depth: 0.64 },
+  { id: "right-hand", label: "Mão D", depth: 0.64 },
+  { id: "left-fingers", label: "Dedos E", depth: 0.52 },
+  { id: "right-fingers", label: "Dedos D", depth: 0.52 },
+  { id: "left-leg", label: "Perna E", depth: 0.67 },
+  { id: "right-leg", label: "Perna D", depth: 0.67 },
+  { id: "left-foot", label: "Pé E", depth: 0.78 },
+  { id: "right-foot", label: "Pé D", depth: 0.78 },
+];
 
 type BuildOptions = {
   mode: GenerationMode;
@@ -41,7 +89,23 @@ const EMPTY_METRICS: Metrics = {
   grid: "—",
   elements: 0,
   triangles: 0,
+  parts: 0,
 };
+
+function classifyCharacterPart(normalizedX: number, normalizedY: number): PartId {
+  if (normalizedY < 0.39) return "head";
+  if (normalizedY > 0.88) return normalizedX < 0.5 ? "left-foot" : "right-foot";
+  if (normalizedY > 0.67) {
+    if (normalizedY > 0.78 && normalizedX < 0.27) return "left-fingers";
+    if (normalizedY > 0.78 && normalizedX > 0.73) return "right-fingers";
+    if (normalizedX < 0.27) return "left-hand";
+    if (normalizedX > 0.73) return "right-hand";
+    return normalizedX < 0.5 ? "left-leg" : "right-leg";
+  }
+  if (normalizedX < 0.27) return "left-arm";
+  if (normalizedX > 0.73) return "right-arm";
+  return "torso";
+}
 
 function colorDistance(
   red: number,
@@ -93,7 +157,7 @@ function sampleBackground(data: Uint8ClampedArray, width: number, height: number
 function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
   const effectiveResolution = Math.min(
     options.resolution,
-    options.mode === "relief" ? 34 : 58,
+    options.mode === "relief" ? 32 : 48,
   );
   const maxDimension = Math.max(image.naturalWidth, image.naturalHeight);
   const width = Math.max(
@@ -121,9 +185,11 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
   }
   const hasTransparency = transparent / (width * height) > 0.03;
   const background = sampleBackground(pixels, width, height);
-  const cell = 3.2 / Math.max(width, height);
-  const geometries: THREE.BufferGeometry[] = [];
-  let elements = 0;
+  const samples: PixelSample[] = [];
+  let minX = width;
+  let maxX = 0;
+  let minY = height;
+  let maxY = 0;
 
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
@@ -137,78 +203,138 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
         : alpha > 28 && colorDistance(red, green, blue, background) > options.threshold;
 
       if (!foreground) continue;
-
-      const luminance = (red * 0.2126 + green * 0.7152 + blue * 0.0722) / 255;
-      const depth = options.depth * (
-        options.mode === "pixel"
-          ? 0.74 + (1 - luminance) * 0.34
-          : 0.5 + (1 - luminance) * 0.92
-      );
-      const geometry = options.mode === "pixel"
-        ? new THREE.BoxGeometry(cell * 0.985, cell * 0.985, depth)
-        : new RoundedBoxGeometry(
-            cell * 1.06,
-            cell * 1.06,
-            depth,
-            2,
-            Math.min(cell * 0.23, depth * 0.22),
-          );
-
-      setGeometryColor(geometry, red, green, blue);
-      geometry.translate(
-        (x - (width - 1) / 2) * cell,
-        ((height - 1) / 2 - y) * cell,
-        depth / 2,
-      );
-      geometries.push(geometry);
-      elements += 1;
+      samples.push({ x, y, red, green, blue });
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
     }
   }
 
-  if (geometries.length === 0) {
+  if (samples.length === 0) {
     throw new Error("Nenhum primeiro plano foi detectado. Reduza o recorte de fundo.");
   }
 
-  const merged = mergeGeometries(geometries, false);
-  geometries.forEach((geometry) => geometry.dispose());
-  if (!merged) throw new Error("Não foi possível consolidar a geometria");
-  merged.computeVertexNormals();
-  merged.computeBoundingBox();
-  merged.computeBoundingSphere();
+  const bboxWidth = Math.max(1, maxX - minX);
+  const bboxHeight = Math.max(1, maxY - minY);
+  const cell = 3.2 / Math.max(width, height);
+  const samplesByPart = new Map<PartId, PixelSample[]>();
+  for (const part of PARTS) samplesByPart.set(part.id, []);
 
-  const material = new THREE.MeshPhysicalMaterial({
-    vertexColors: true,
-    roughness: options.mode === "pixel" ? 0.76 : 0.58,
-    metalness: 0,
-    clearcoat: options.mode === "relief" ? 0.14 : 0,
-    clearcoatRoughness: 0.8,
-  });
-  const mesh = new THREE.Mesh(merged, material);
-  mesh.name = options.mode === "pixel" ? "Pixel3D_Geometry" : "SmoothRelief_Geometry";
-  mesh.castShadow = true;
-  mesh.receiveShadow = true;
+  for (const sample of samples) {
+    const normalizedX = (sample.x - minX) / bboxWidth;
+    const normalizedY = (sample.y - minY) / bboxHeight;
+    samplesByPart.get(classifyCharacterPart(normalizedX, normalizedY))?.push(sample);
+  }
 
-  const group = new THREE.Group();
-  group.name = "ImageTo3D_Asset";
-  group.add(mesh);
-  group.userData.generation = {
+  const model = new THREE.Group();
+  model.name = "ImageTo3D_EditableCharacter";
+  let voxelCount = 0;
+  let triangleCount = 0;
+
+  for (const partDefinition of PARTS) {
+    const partSamples = samplesByPart.get(partDefinition.id) ?? [];
+    if (partSamples.length === 0) continue;
+
+    const partMinX = Math.min(...partSamples.map((sample) => sample.x));
+    const partMaxX = Math.max(...partSamples.map((sample) => sample.x));
+    const partCenterX = (partMinX + partMaxX) / 2;
+    const partRadiusX = Math.max(1, (partMaxX - partMinX) / 2);
+    const geometries: THREE.BufferGeometry[] = [];
+    let partVoxelCount = 0;
+
+    for (const sample of partSamples) {
+      const normalizedRadius = Math.min(1, Math.abs(sample.x - partCenterX) / partRadiusX);
+      const roundProfile = Math.sqrt(Math.max(0.08, 1 - normalizedRadius * normalizedRadius));
+      const requestedLayers = Math.max(
+        2,
+        Math.round((options.depth / cell) * partDefinition.depth * (0.42 + roundProfile * 0.58)),
+      );
+
+      for (let layer = 0; layer < requestedLayers; layer += 1) {
+        const geometry = options.mode === "pixel"
+          ? new THREE.BoxGeometry(cell * 0.92, cell * 0.92, cell * 0.92)
+          : new RoundedBoxGeometry(cell * 0.94, cell * 0.94, cell * 0.94, 2, cell * 0.16);
+        setGeometryColor(geometry, sample.red, sample.green, sample.blue);
+        geometry.translate(
+          (sample.x - (width - 1) / 2) * cell,
+          ((height - 1) / 2 - sample.y) * cell,
+          (layer - (requestedLayers - 1) / 2) * cell,
+        );
+        geometries.push(geometry);
+        partVoxelCount += 1;
+      }
+    }
+
+    const merged = mergeGeometries(geometries, false);
+    geometries.forEach((geometry) => geometry.dispose());
+    if (!merged) continue;
+    merged.computeVertexNormals();
+    merged.computeBoundingBox();
+    merged.computeBoundingSphere();
+
+    const material = new THREE.MeshPhysicalMaterial({
+      color: 0xffffff,
+      vertexColors: true,
+      roughness: options.mode === "pixel" ? 0.78 : 0.62,
+      metalness: 0,
+      clearcoat: options.mode === "relief" ? 0.08 : 0,
+      clearcoatRoughness: 0.86,
+      emissive: 0x000000,
+    });
+    const mesh = new THREE.Mesh(merged, material);
+    mesh.name = `${partDefinition.id}-voxels`;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+
+    const partGroup = new THREE.Group();
+    partGroup.name = `part:${partDefinition.id}`;
+    partGroup.userData.partId = partDefinition.id;
+    partGroup.userData.label = partDefinition.label;
+    partGroup.userData.voxels = partVoxelCount;
+    partGroup.add(mesh);
+    model.add(partGroup);
+
+    voxelCount += partVoxelCount;
+    triangleCount += Math.round(
+      merged.index ? merged.index.count / 3 : merged.getAttribute("position").count / 3,
+    );
+  }
+
+  model.userData.generation = {
     mode: options.mode,
+    segmentation: "character-auto-v1",
     sourceWidth: image.naturalWidth,
     sourceHeight: image.naturalHeight,
     sampleWidth: width,
     sampleHeight: height,
-    elements,
+    voxels: voxelCount,
   };
 
   return {
-    group,
+    group: model,
     metrics: {
       source: `${image.naturalWidth}×${image.naturalHeight}`,
       grid: `${width}×${height}`,
-      elements,
-      triangles: Math.round(merged.index ? merged.index.count / 3 : merged.getAttribute("position").count / 3),
+      elements: voxelCount,
+      triangles: triangleCount,
+      parts: model.children.length,
     } satisfies Metrics,
   };
+}
+
+function summarizeParts(model: THREE.Group): PartSummary[] {
+  return model.children.flatMap((child) => {
+    const id = child.userData.partId as PartId | undefined;
+    if (!id) return [];
+    return [{
+      id,
+      label: String(child.userData.label ?? id),
+      visible: child.visible,
+      voxels: Number(child.userData.voxels ?? 0),
+      position: [child.position.x, child.position.y, child.position.z] as [number, number, number],
+    }];
+  });
 }
 
 function disposeObject(object: THREE.Object3D) {
@@ -242,6 +368,9 @@ export function ImageTo3DStudio() {
   const [status, setStatus] = useState("Preparando exemplo…");
   const [dragging, setDragging] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [parts, setParts] = useState<PartSummary[]>([]);
+  const [selectedPartId, setSelectedPartId] = useState<PartId | null>(null);
+  const [partColor, setPartColor] = useState("#ffffff");
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -310,6 +439,21 @@ export function ImageTo3DStudio() {
     observer.observe(viewer);
     resize();
 
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    const selectFromCanvas = (event: PointerEvent) => {
+      if (Math.abs(event.movementX) > 3 || Math.abs(event.movementY) > 3) return;
+      const rect = canvas.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const hit = raycaster.intersectObject(root, true)[0];
+      let target: THREE.Object3D | null = hit?.object ?? null;
+      while (target && !target.userData.partId) target = target.parent;
+      if (target?.userData.partId) setSelectedPartId(target.userData.partId as PartId);
+    };
+    canvas.addEventListener("pointerup", selectFromCanvas);
+
     const clock = new THREE.Clock();
     renderer.setAnimationLoop(() => {
       const delta = Math.min(clock.getDelta(), 0.05);
@@ -320,6 +464,7 @@ export function ImageTo3DStudio() {
 
     return () => {
       observer.disconnect();
+      canvas.removeEventListener("pointerup", selectFromCanvas);
       renderer.setAnimationLoop(null);
       controls.dispose();
       if (root.children[0]) disposeObject(root.children[0]);
@@ -370,10 +515,16 @@ export function ImageTo3DStudio() {
         root.add(result.group);
         root.rotation.set(0, 0, 0);
         setMetrics(result.metrics);
+        const nextParts = summarizeParts(result.group);
+        setParts(nextParts);
+        setSelectedPartId(nextParts[0]?.id ?? null);
+        setPartColor("#ffffff");
         setActiveView("front");
-        setStatus("Geometria pronta");
+        setStatus(`${result.metrics.parts} partes · ${result.metrics.elements.toLocaleString("pt-BR")} blocos`);
       } catch (error) {
         setMetrics(EMPTY_METRICS);
+        setParts([]);
+        setSelectedPartId(null);
         setStatus(error instanceof Error ? error.message : "Falha na geração");
       }
     }, 100);
@@ -419,6 +570,79 @@ export function ImageTo3DStudio() {
     spinRef.current = next;
   };
 
+  const getPartGroup = useCallback((partId: PartId | null) => {
+    const model = rootRef.current?.children[0];
+    if (!model || !partId) return null;
+    return model.getObjectByName(`part:${partId}`) as THREE.Group | null;
+  }, []);
+
+  const refreshParts = useCallback(() => {
+    const model = rootRef.current?.children[0];
+    if (model instanceof THREE.Group) setParts(summarizeParts(model));
+  }, []);
+
+  useEffect(() => {
+    const model = rootRef.current?.children[0];
+    if (!model) return;
+    model.traverse((object) => {
+      if (!(object instanceof THREE.Mesh)) return;
+      const material = object.material;
+      if (!(material instanceof THREE.MeshPhysicalMaterial)) return;
+      const partId = object.parent?.userData.partId as PartId | undefined;
+      material.emissive.set(partId === selectedPartId ? 0x183d2a : 0x000000);
+      material.emissiveIntensity = partId === selectedPartId ? 0.42 : 0;
+    });
+  }, [selectedPartId, parts]);
+
+  const selectedPart = parts.find((part) => part.id === selectedPartId) ?? null;
+
+  const togglePartVisibility = useCallback((partId: PartId) => {
+    const group = getPartGroup(partId);
+    if (!group) return;
+    group.visible = !group.visible;
+    refreshParts();
+  }, [getPartGroup, refreshParts]);
+
+  const recolorPart = useCallback((hex: string) => {
+    setPartColor(hex);
+    const group = getPartGroup(selectedPartId);
+    group?.traverse((object) => {
+      if (!(object instanceof THREE.Mesh)) return;
+      const material = object.material;
+      if (!(material instanceof THREE.MeshPhysicalMaterial)) return;
+      material.vertexColors = false;
+      material.color.set(hex);
+      material.needsUpdate = true;
+    });
+  }, [getPartGroup, selectedPartId]);
+
+  const restorePartColors = useCallback(() => {
+    const group = getPartGroup(selectedPartId);
+    group?.traverse((object) => {
+      if (!(object instanceof THREE.Mesh)) return;
+      const material = object.material;
+      if (!(material instanceof THREE.MeshPhysicalMaterial)) return;
+      material.vertexColors = true;
+      material.color.set(0xffffff);
+      material.needsUpdate = true;
+    });
+    setPartColor("#ffffff");
+  }, [getPartGroup, selectedPartId]);
+
+  const movePart = useCallback((axis: "x" | "y" | "z", value: number) => {
+    const group = getPartGroup(selectedPartId);
+    if (!group) return;
+    group.position[axis] = value;
+    refreshParts();
+  }, [getPartGroup, refreshParts, selectedPartId]);
+
+  const resetPartTransform = useCallback(() => {
+    const group = getPartGroup(selectedPartId);
+    if (!group) return;
+    group.position.set(0, 0, 0);
+    refreshParts();
+  }, [getPartGroup, refreshParts, selectedPartId]);
+
   const exportGlb = useCallback(async () => {
     const source = rootRef.current?.children[0];
     if (!source) return;
@@ -458,7 +682,7 @@ export function ImageTo3DStudio() {
           <span>IMAGE<span>→</span>3D</span>
         </div>
         <div className="build-tag">
-          <span className="status-dot" /> local geometry engine · alpha 0.1
+          <span className="status-dot" /> editable voxel engine · alpha 0.2
         </div>
       </header>
 
@@ -468,8 +692,8 @@ export function ImageTo3DStudio() {
           <h1>Uma imagem entra. <em>Geometria editável sai.</em></h1>
         </div>
         <p className="intro-copy">
-          Converta qualquer imagem isolada em Pixel 3D ou relevo suave. Ajuste a
-          reconstrução ao vivo, inspecione todos os ângulos e exporte um GLB real.
+          A imagem é segmentada em cabeça, tronco e membros; cada região recebe
+          camadas reais de blocos e continua selecionável depois da geração.
         </p>
       </section>
 
@@ -515,8 +739,8 @@ export function ImageTo3DStudio() {
               onClick={() => setMode("pixel")}
             >
               <Grid3X3 size={18} />
-              <strong>Pixel 3D</strong>
-              <span>fidelidade frontal</span>
+              <strong>Blocos voxel</strong>
+              <span>cubos com profundidade</span>
             </button>
             <button
               className={`mode-button ${mode === "relief" ? "is-active" : ""}`}
@@ -524,8 +748,8 @@ export function ImageTo3DStudio() {
               onClick={() => setMode("relief")}
             >
               <Sparkles size={18} />
-              <strong>Relevo</strong>
-              <span>volumes suaves</span>
+              <strong>Blocos suaves</strong>
+              <span>cantos arredondados</span>
             </button>
           </div>
 
@@ -585,7 +809,7 @@ export function ImageTo3DStudio() {
           <div className="viewer-bottom">
             <div className="viewer-title">
               <small>live procedural preview</small>
-              <strong>{mode === "pixel" ? "Pixel volume" : "Smooth relief"}</strong>
+              <strong>{mode === "pixel" ? "Editable voxel character" : "Rounded voxel character"}</strong>
             </div>
             <button
               className={`spin-button ${autoRotate ? "is-active" : ""}`}
@@ -600,31 +824,105 @@ export function ImageTo3DStudio() {
         <aside className="inspector">
           <div>
             <div className="panel-heading">
-              <h2>Geometria</h2>
+              <h2>Partes</h2>
               <span className="step-number">03</span>
             </div>
-            <div className="metric-grid">
-              <div className="metric"><span>Origem</span><strong>{metrics.source}</strong></div>
-              <div className="metric"><span>Amostra</span><strong>{metrics.grid}</strong></div>
-              <div className="metric"><span>Elementos</span><strong>{metrics.elements.toLocaleString("pt-BR")}</strong></div>
-              <div className="metric"><span>Triângulos</span><strong>{metrics.triangles.toLocaleString("pt-BR")}</strong></div>
+            <div className="part-list" aria-label="Partes editáveis do personagem">
+              {parts.map((part) => (
+                <div
+                  className={`part-row ${selectedPartId === part.id ? "is-selected" : ""}`}
+                  key={part.id}
+                >
+                  <button
+                    type="button"
+                    className="part-select"
+                    onClick={() => setSelectedPartId(part.id)}
+                  >
+                    <span>{part.label}</span>
+                    <small>{part.voxels.toLocaleString("pt-BR")} blocos</small>
+                  </button>
+                  <button
+                    type="button"
+                    className="visibility-button"
+                    aria-label={`${part.visible ? "Ocultar" : "Mostrar"} ${part.label}`}
+                    onClick={() => togglePartVisibility(part.id)}
+                  >
+                    {part.visible ? <Eye size={14} /> : <EyeOff size={14} />}
+                  </button>
+                </div>
+              ))}
             </div>
           </div>
 
           <div className="divider" />
-          <div>
+          <div className="part-editor">
             <div className="panel-heading">
-              <h3>Prontidão</h3>
-              <CircleCheck size={14} color="#a8ffcf" />
+              <h3>{selectedPart?.label ?? "Selecione uma parte"}</h3>
+              <Move3D size={14} color="#a8ffcf" />
             </div>
-            <div className="readiness">
-              <div className="readiness-row"><span>Geometria consolidada</span><b>ready</b></div>
-              <div className="readiness-row"><span>Cores por vértice</span><b>ready</b></div>
-              <div className="readiness-row"><span>Hierarchy GLTF</span><b>ready</b></div>
-            </div>
+            {selectedPart ? (
+              <>
+                <div className="color-editor">
+                  <label>
+                    <Palette size={14} /> Cor da parte
+                    <input
+                      type="color"
+                      value={partColor}
+                      onChange={(event) => recolorPart(event.target.value)}
+                    />
+                  </label>
+                  <button type="button" onClick={restorePartColors}>
+                    <Undo2 size={13} /> Original
+                  </button>
+                </div>
+
+                <div className="axis-editor">
+                  {(["x", "y", "z"] as const).map((axis, index) => (
+                    <label className="axis-row" key={axis}>
+                      <span>{axis.toUpperCase()}</span>
+                      <input
+                        type="range"
+                        min="-1.2"
+                        max="1.2"
+                        step="0.02"
+                        value={selectedPart.position[index]}
+                        onChange={(event) => movePart(axis, Number(event.target.value))}
+                      />
+                      <output>{selectedPart.position[index].toFixed(2)}</output>
+                    </label>
+                  ))}
+                </div>
+
+                <div className="part-actions">
+                  <button type="button" onClick={resetPartTransform}>
+                    <Undo2 size={13} /> Posição
+                  </button>
+                  <button
+                    type="button"
+                    className="danger-action"
+                    onClick={() => togglePartVisibility(selectedPart.id)}
+                  >
+                    <Trash2 size={13} /> Remover
+                  </button>
+                </div>
+              </>
+            ) : (
+              <p className="empty-editor">Clique em uma parte no modelo ou na lista.</p>
+            )}
+          </div>
+
+          <div className="compact-metrics">
+            <span>{metrics.parts} partes</span>
+            <span>{metrics.elements.toLocaleString("pt-BR")} blocos</span>
+            <span>{metrics.triangles.toLocaleString("pt-BR")} tris</span>
           </div>
 
           <div>
+            <div className="divider" />
+            <div className="editor-tip">
+              Clique no corpo para selecionar. Cor, posição e visibilidade são
+              preservadas no GLB exportado.
+            </div>
             <button
               className="export-button"
               type="button"
@@ -647,19 +945,19 @@ export function ImageTo3DStudio() {
           <p>PNG transparente, sprite, render ou fotografia com fundo simples.</p>
         </article>
         <article className="workflow-step">
-          <span>02 / SAMPLE</span>
-          <h3>Silhueta mensurável</h3>
-          <p>Alpha e distância cromática separam o objeto do ambiente.</p>
+          <span>02 / SEGMENT</span>
+          <h3>Corpo dividido</h3>
+          <p>Cabeça, tronco, braços, mãos, pernas e pés viram grupos independentes.</p>
         </article>
         <article className="workflow-step">
           <span>03 / BUILD</span>
-          <h3>Geometria real</h3>
-          <p>Volumes, normais, cores e hierarquia são gerados no navegador.</p>
+          <h3>Volume em blocos</h3>
+          <p>Camadas voxel formam frente, laterais e costas com perfil arredondado.</p>
         </article>
         <article className="workflow-step">
-          <span>04 / SHIP</span>
-          <h3>GLB interoperável</h3>
-          <p>Abra no Blender, Three.js, Unity ou no pipeline do seu jogo.</p>
+          <span>04 / EDIT + SHIP</span>
+          <h3>GLB ainda editável</h3>
+          <p>Recolora, reposicione ou remova partes antes de abrir no seu pipeline.</p>
         </article>
       </section>
     </main>
