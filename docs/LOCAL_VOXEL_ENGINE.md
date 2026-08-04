@@ -46,6 +46,8 @@ roda no navegador sem servidor, token ou GPU dedicada.
 - Cor, movimento X/Y/Z, restauração e exclusão são aplicados a um, vários ou todos os pixels selecionados.
 - A barra inclui lápis, borracha, preenchimento, conta-gotas, seleção retangular, varinha, laço, linha, retângulo e círculo.
 - O tamanho físico dos pixels pode ser alterado depois da geração, sem reconstruir o modelo nem descartar edições.
+- O motor anatômico v3 usa seções elípticas suavizadas por região para formar crânio, tronco, braços, mãos, pernas e pés sem achatar a vista lateral.
+- O modo pixel usa material físico com luz principal, preenchimento e recorte para revelar volume sem perder a cor original da frente.
 - Build e testes do site aprovados.
 
 ## Próximas melhorias locais

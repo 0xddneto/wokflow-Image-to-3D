@@ -86,19 +86,31 @@ type AnatomyGuides = {
   footStart: number;
 };
 
+type CrossSection = {
+  center: number;
+  halfWidth: number;
+};
+
+type AnatomyProfile = {
+  rows: Map<number, CrossSection>;
+  minY: number;
+  maxY: number;
+  referenceHalfWidth: number;
+};
+
 const PARTS: Array<{ id: PartId; label: string; depth: number }> = [
-  { id: "head", label: "Cabeça", depth: 1 },
-  { id: "torso", label: "Tronco", depth: 0.88 },
-  { id: "left-arm", label: "Braço E", depth: 0.58 },
-  { id: "right-arm", label: "Braço D", depth: 0.58 },
-  { id: "left-hand", label: "Mão E", depth: 0.64 },
-  { id: "right-hand", label: "Mão D", depth: 0.64 },
-  { id: "left-fingers", label: "Dedos E", depth: 0.52 },
-  { id: "right-fingers", label: "Dedos D", depth: 0.52 },
-  { id: "left-leg", label: "Perna E", depth: 0.67 },
-  { id: "right-leg", label: "Perna D", depth: 0.67 },
-  { id: "left-foot", label: "Pé E", depth: 0.78 },
-  { id: "right-foot", label: "Pé D", depth: 0.78 },
+  { id: "head", label: "Cabeça", depth: 1.08 },
+  { id: "torso", label: "Tronco", depth: 1.05 },
+  { id: "left-arm", label: "Braço E", depth: 0.88 },
+  { id: "right-arm", label: "Braço D", depth: 0.88 },
+  { id: "left-hand", label: "Mão E", depth: 0.96 },
+  { id: "right-hand", label: "Mão D", depth: 0.96 },
+  { id: "left-fingers", label: "Dedos E", depth: 0.78 },
+  { id: "right-fingers", label: "Dedos D", depth: 0.78 },
+  { id: "left-leg", label: "Perna E", depth: 0.9 },
+  { id: "right-leg", label: "Perna D", depth: 0.9 },
+  { id: "left-foot", label: "Pé E", depth: 1 },
+  { id: "right-foot", label: "Pé D", depth: 1 },
 ];
 
 type BuildOptions = {
@@ -231,6 +243,123 @@ function buildDistanceField(mask: Uint8Array, width: number, height: number) {
     }
   }
   return field;
+}
+
+function buildAnatomyProfile(samples: PixelSample[], partId: PartId): AnatomyProfile {
+  const rawRows = new Map<number, { minX: number; maxX: number }>();
+  let minY = Number.POSITIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+
+  for (const sample of samples) {
+    const row = rawRows.get(sample.y) ?? { minX: sample.x, maxX: sample.x };
+    row.minX = Math.min(row.minX, sample.x);
+    row.maxX = Math.max(row.maxX, sample.x);
+    rawRows.set(sample.y, row);
+    minY = Math.min(minY, sample.y);
+    maxY = Math.max(maxY, sample.y);
+  }
+
+  const isCoreVolume = partId === "head" || partId === "torso";
+  const smoothingWindow = partId === "head" ? 4 : isCoreVolume ? 3 : 2;
+  const rows = new Map<number, CrossSection>();
+  const observedHalfWidths: number[] = [];
+
+  for (let y = minY; y <= maxY; y += 1) {
+    let weightedCenter = 0;
+    let weightedHalfWidth = 0;
+    let totalWeight = 0;
+    for (let offset = -smoothingWindow; offset <= smoothingWindow; offset += 1) {
+      const row = rawRows.get(y + offset);
+      if (!row) continue;
+      const weight = smoothingWindow + 1 - Math.abs(offset);
+      weightedCenter += ((row.minX + row.maxX) / 2) * weight;
+      weightedHalfWidth += Math.max(1, (row.maxX - row.minX + 1) / 2) * weight;
+      totalWeight += weight;
+    }
+    if (totalWeight === 0) continue;
+    const halfWidth = weightedHalfWidth / totalWeight;
+    rows.set(y, {
+      center: weightedCenter / totalWeight,
+      halfWidth,
+    });
+    observedHalfWidths.push(halfWidth);
+  }
+
+  observedHalfWidths.sort((a, b) => a - b);
+  const percentileIndex = Math.min(
+    observedHalfWidths.length - 1,
+    Math.floor(observedHalfWidths.length * (isCoreVolume ? 0.78 : 0.68)),
+  );
+
+  return {
+    rows,
+    minY,
+    maxY,
+    referenceHalfWidth: Math.max(1.5, observedHalfWidths[percentileIndex] ?? 1.5),
+  };
+}
+
+function getAnatomicalRadius(
+  sample: PixelSample,
+  profile: AnatomyProfile,
+  partId: PartId,
+  depthMultiplier: number,
+) {
+  const crossSection = profile.rows.get(sample.y);
+  if (!crossSection) return 1;
+
+  const normalizedX = THREE.MathUtils.clamp(
+    (sample.x - crossSection.center) / Math.max(1, crossSection.halfWidth),
+    -1,
+    1,
+  );
+  const circularSection = Math.sqrt(Math.max(0, 1 - normalizedX * normalizedX));
+  const height = Math.max(1, profile.maxY - profile.minY + 1);
+  const normalizedY = THREE.MathUtils.clamp((sample.y - profile.minY) / height, 0, 1);
+
+  let longitudinalShape = 1;
+  if (partId === "head") {
+    const centeredY = (normalizedY - 0.48) / 0.58;
+    longitudinalShape = 0.72 + 0.28 * Math.sqrt(Math.max(0, 1 - centeredY * centeredY));
+  } else if (partId === "torso") {
+    const chest = Math.exp(-Math.pow((normalizedY - 0.25) / 0.28, 2));
+    const belly = Math.exp(-Math.pow((normalizedY - 0.7) / 0.3, 2));
+    longitudinalShape = 0.78 + chest * 0.08 + belly * 0.22;
+  } else if (partId.includes("foot")) {
+    longitudinalShape = 0.84 + 0.16 * Math.sin(Math.PI * normalizedY);
+  } else {
+    longitudinalShape = 0.88 + 0.12 * Math.sin(Math.PI * normalizedY);
+  }
+
+  const localWidth = THREE.MathUtils.lerp(
+    profile.referenceHalfWidth,
+    crossSection.halfWidth,
+    partId === "head" || partId === "torso" ? 0.58 : 0.76,
+  );
+  return Math.max(1, localWidth * depthMultiplier * longitudinalShape * circularSection);
+}
+
+function getAnatomicalFrontDepth(
+  sample: PixelSample,
+  profile: AnatomyProfile,
+  partId: PartId,
+  depthMultiplier: number,
+) {
+  const crossSection = profile.rows.get(sample.y);
+  if (!crossSection) return 1;
+  const rowDepth = getAnatomicalRadius(
+    { ...sample, x: crossSection.center },
+    profile,
+    partId,
+    depthMultiplier,
+  );
+  const normalizedX = THREE.MathUtils.clamp(
+    (sample.x - crossSection.center) / Math.max(1, crossSection.halfWidth),
+    -1,
+    1,
+  );
+  const curvature = partId === "head" ? 0.3 : partId === "torso" ? 0.22 : 0.16;
+  return rowDepth * (1 - curvature * normalizedX * normalizedX);
 }
 
 function colorDistance(
@@ -372,39 +501,60 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
     const partSamples = samplesByPart.get(partDefinition.id) ?? [];
     if (partSamples.length === 0) continue;
 
-    const depthScale = THREE.MathUtils.mapLinear(options.depth, 0.12, 0.9, 0.42, 1.08);
+    const depthScale = THREE.MathUtils.mapLinear(options.depth, 0.12, 0.9, 0.6, 1.28);
     const baseColor = getRepresentativeColor(partSamples);
+    const anatomyProfile = buildAnatomyProfile(partSamples, partDefinition.id);
     const voxels: VoxelBuild[] = [];
 
     for (const sample of partSamples) {
       const distance = distanceField[sample.y * width + sample.x];
+      const maxPartRadius = Math.max(3, Math.round(bboxWidth * 0.48));
       const radius = THREE.MathUtils.clamp(
-        Math.round(distance * partDefinition.depth * depthScale),
+        Math.ceil(getAnatomicalRadius(
+          sample,
+          anatomyProfile,
+          partDefinition.id,
+          partDefinition.depth * depthScale,
+        )),
         1,
-        Math.max(2, Math.round(bboxWidth * 0.28)),
+        maxPartRadius,
+      );
+      const frontDepth = THREE.MathUtils.clamp(
+        Math.ceil(getAnatomicalFrontDepth(
+          sample,
+          anatomyProfile,
+          partDefinition.id,
+          partDefinition.depth * depthScale,
+        )),
+        1,
+        maxPartRadius,
       );
 
-      for (let z = -radius; z <= radius; z += 1) {
+      const zLayers = new Set<number>([-radius, frontDepth]);
+      if (distance <= 2.5) {
+        for (let z = -radius; z <= frontDepth; z += 1) zLayers.add(z);
+      }
+
+      for (const z of zLayers) {
         voxels.push({
           ...sample,
           z,
-          front: z === radius,
+          front: z === frontDepth,
           back: z === -radius,
-          rim: distance <= 1.5,
+          rim: distance <= 2.5,
         });
       }
     }
 
     const geometry = options.mode === "pixel"
-      ? new THREE.BoxGeometry(cell * 0.72, cell * 0.72, cell * 0.72)
-      : new RoundedBoxGeometry(cell * 0.82, cell * 0.82, cell * 0.82, 2, cell * 0.14);
-    const material = options.mode === "pixel"
-      ? new THREE.MeshBasicMaterial({ color: 0xffffff })
-      : new THREE.MeshStandardMaterial({
-        color: 0xffffff,
-        roughness: 0.72,
-        metalness: 0,
-      });
+      ? new THREE.BoxGeometry(cell * 0.96, cell * 0.96, cell * 0.96)
+      : new RoundedBoxGeometry(cell * 0.92, cell * 0.92, cell * 0.92, 2, cell * 0.16);
+    const material = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: options.mode === "pixel" ? 0.82 : 0.68,
+      metalness: 0,
+      flatShading: options.mode === "pixel",
+    });
     const mesh = new THREE.InstancedMesh(geometry, material, voxels.length);
     mesh.name = `${partDefinition.id}-voxels`;
     mesh.userData.partId = partDefinition.id;
@@ -414,7 +564,7 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
     mesh.userData.currentColors = [] as number[][];
     mesh.userData.frontInstanceIds = [] as number[];
     mesh.userData.pixelCoordinates = [] as Array<[number, number, number, number]>;
-    mesh.userData.renderPixelSize = options.mode === "pixel" ? 0.72 : 0.82;
+    mesh.userData.renderPixelSize = options.mode === "pixel" ? 0.96 : 0.92;
     mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
@@ -425,7 +575,7 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
     const scale = new THREE.Vector3(1, 1, 1);
     const surfaceColor = new THREE.Color();
     const sideColor = new THREE.Color();
-    const backColor = baseColor.clone().multiplyScalar(0.9);
+    const backColor = baseColor.clone().multiplyScalar(0.92);
     voxels.forEach((voxel, index) => {
       position.set(
         (voxel.x - (width - 1) / 2) * cell,
@@ -440,7 +590,7 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
         voxel.blue / 255,
         THREE.SRGBColorSpace,
       );
-      sideColor.copy(surfaceColor).lerp(baseColor, 0.58).multiplyScalar(0.84);
+      sideColor.copy(baseColor).multiplyScalar(0.96);
       const color = voxel.front
         ? surfaceColor
         : voxel.back
@@ -475,7 +625,7 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
 
   model.userData.generation = {
     mode: options.mode,
-    segmentation: "native-pixel-silhouette-sdf-v2",
+    segmentation: "native-pixel-anatomical-capsules-v3",
     sourceWidth: image.naturalWidth,
     sourceHeight: image.naturalHeight,
     sampleWidth: width,
@@ -530,7 +680,7 @@ export function ImageTo3DStudio() {
   const [selectedPixels, setSelectedPixels] = useState<SelectedPixel[]>([]);
   const [selectionColor, setSelectionColor] = useState("#ffffff");
   const [activeTool, setActiveTool] = useState<PixelTool | null>("box-select");
-  const [pixelSize, setPixelSize] = useState(0.72);
+  const [pixelSize, setPixelSize] = useState(0.96);
   const activeToolRef = useRef<PixelTool | null>(activeTool);
   const selectionColorRef = useRef(selectionColor);
 
@@ -545,7 +695,8 @@ export function ImageTo3DStudio() {
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.toneMapping = THREE.NoToneMapping;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.35;
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     rendererRef.current = renderer;
@@ -571,18 +722,18 @@ export function ImageTo3DStudio() {
     scene.add(root);
     rootRef.current = root;
 
-    const key = new THREE.DirectionalLight(0xffe5d2, 1.15);
+    const key = new THREE.DirectionalLight(0xffe5d2, 1.65);
     key.position.set(-3.5, 5, 5);
     key.castShadow = true;
     key.shadow.mapSize.set(1024, 1024);
     scene.add(key);
-    const fill = new THREE.DirectionalLight(0xa9c8ff, 0.32);
+    const fill = new THREE.DirectionalLight(0xa9c8ff, 0.48);
     fill.position.set(4, 1.5, 3);
     scene.add(fill);
-    const rim = new THREE.DirectionalLight(0xa8ffcf, 0.48);
+    const rim = new THREE.DirectionalLight(0xa8ffcf, 0.62);
     rim.position.set(1, 3, -5);
     scene.add(rim);
-    scene.add(new THREE.HemisphereLight(0xe8f4ff, 0x1b222a, 0.62));
+    scene.add(new THREE.HemisphereLight(0xe8f4ff, 0x1b222a, 0.9));
 
     const floor = new THREE.Mesh(
       new THREE.CircleGeometry(3.6, 72),
@@ -1203,7 +1354,7 @@ export function ImageTo3DStudio() {
           <span>IMAGE<span>→</span>3D</span>
         </div>
         <div className="build-tag">
-          <span className="status-dot" /> local silhouette engine · alpha 0.4
+          <span className="status-dot" /> local anatomy engine · alpha 0.5
         </div>
       </header>
 
@@ -1488,7 +1639,7 @@ export function ImageTo3DStudio() {
         <article className="workflow-step">
           <span>03 / BUILD</span>
           <h3>Frente pixel a pixel</h3>
-          <p>A grade nativa preserva cada pixel da imagem como um cubo frontal separado.</p>
+          <p>A grade nativa preserva cada pixel frontal e infla cabeça, tronco e membros como volumes anatômicos.</p>
         </article>
         <article className="workflow-step">
           <span>04 / EDIT + SHIP</span>
