@@ -19,7 +19,6 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
-import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 
 type GenerationMode = "pixel" | "relief";
 type ViewName = "front" | "quarter" | "side";
@@ -62,6 +61,29 @@ type PixelSample = {
   blue: number;
 };
 
+type SelectedVoxel = {
+  partId: PartId;
+  instanceId: number;
+};
+
+type VoxelBuild = PixelSample & {
+  z: number;
+  front: boolean;
+  back: boolean;
+  rim: boolean;
+};
+
+type AnatomyGuides = {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  centerX: number;
+  headBottom: number;
+  legStart: number;
+  footStart: number;
+};
+
 const PARTS: Array<{ id: PartId; label: string; depth: number }> = [
   { id: "head", label: "Cabeça", depth: 1 },
   { id: "torso", label: "Tronco", depth: 0.88 },
@@ -92,19 +114,107 @@ const EMPTY_METRICS: Metrics = {
   parts: 0,
 };
 
-function classifyCharacterPart(normalizedX: number, normalizedY: number): PartId {
-  if (normalizedY < 0.39) return "head";
-  if (normalizedY > 0.88) return normalizedX < 0.5 ? "left-foot" : "right-foot";
-  if (normalizedY > 0.67) {
-    if (normalizedY > 0.78 && normalizedX < 0.27) return "left-fingers";
-    if (normalizedY > 0.78 && normalizedX > 0.73) return "right-fingers";
-    if (normalizedX < 0.27) return "left-hand";
-    if (normalizedX > 0.73) return "right-hand";
-    return normalizedX < 0.5 ? "left-leg" : "right-leg";
+function inferAnatomyGuides(
+  mask: Uint8Array,
+  width: number,
+  minX: number,
+  maxX: number,
+  minY: number,
+  maxY: number,
+): AnatomyGuides {
+  const bboxHeight = Math.max(1, maxY - minY + 1);
+  const bboxWidth = Math.max(1, maxX - minX + 1);
+  const centerX = (minX + maxX) / 2;
+  let headBottom = Math.round(minY + bboxHeight * 0.39);
+  let bestNeckScore = Number.POSITIVE_INFINITY;
+
+  for (
+    let y = Math.round(minY + bboxHeight * 0.28);
+    y <= Math.round(minY + bboxHeight * 0.49);
+    y += 1
+  ) {
+    let rowMin = width;
+    let rowMax = -1;
+    for (let x = minX; x <= maxX; x += 1) {
+      if (!mask[y * width + x]) continue;
+      rowMin = Math.min(rowMin, x);
+      rowMax = Math.max(rowMax, x);
+    }
+    if (rowMax < rowMin) continue;
+    const rowWidth = rowMax - rowMin + 1;
+    const expected = minY + bboxHeight * 0.39;
+    const score = rowWidth + Math.abs(y - expected) * bboxWidth * 0.035;
+    if (score < bestNeckScore) {
+      bestNeckScore = score;
+      headBottom = y;
+    }
   }
-  if (normalizedX < 0.27) return "left-arm";
-  if (normalizedX > 0.73) return "right-arm";
+
+  return {
+    minX,
+    maxX,
+    minY,
+    maxY,
+    centerX,
+    headBottom,
+    legStart: Math.round(minY + bboxHeight * 0.68),
+    footStart: Math.round(minY + bboxHeight * 0.86),
+  };
+}
+
+function classifyCharacterPart(x: number, y: number, guides: AnatomyGuides): PartId {
+  const bboxWidth = Math.max(1, guides.maxX - guides.minX + 1);
+  const bboxHeight = Math.max(1, guides.maxY - guides.minY + 1);
+  const normalizedY = (y - guides.minY) / bboxHeight;
+  const sideDistance = Math.abs(x - guides.centerX) / bboxWidth;
+  const left = x < guides.centerX;
+
+  if (y <= guides.headBottom) return "head";
+  if (y >= guides.footStart) return left ? "left-foot" : "right-foot";
+  if (y >= guides.legStart && sideDistance < 0.27) {
+    return left ? "left-leg" : "right-leg";
+  }
+  if (sideDistance > 0.25) {
+    if (normalizedY > 0.67) return left ? "left-fingers" : "right-fingers";
+    if (normalizedY > 0.57) return left ? "left-hand" : "right-hand";
+    return left ? "left-arm" : "right-arm";
+  }
   return "torso";
+}
+
+function buildDistanceField(mask: Uint8Array, width: number, height: number) {
+  const field = new Float32Array(width * height);
+  const diagonal = Math.SQRT2;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      field[index] = mask[index]
+        ? Math.min(x + 1, y + 1, width - x, height - y)
+        : 0;
+    }
+  }
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!mask[index]) continue;
+      if (x > 0) field[index] = Math.min(field[index], field[index - 1] + 1);
+      if (y > 0) field[index] = Math.min(field[index], field[index - width] + 1);
+      if (x > 0 && y > 0) field[index] = Math.min(field[index], field[index - width - 1] + diagonal);
+      if (x + 1 < width && y > 0) field[index] = Math.min(field[index], field[index - width + 1] + diagonal);
+    }
+  }
+  for (let y = height - 1; y >= 0; y -= 1) {
+    for (let x = width - 1; x >= 0; x -= 1) {
+      const index = y * width + x;
+      if (!mask[index]) continue;
+      if (x + 1 < width) field[index] = Math.min(field[index], field[index + 1] + 1);
+      if (y + 1 < height) field[index] = Math.min(field[index], field[index + width] + 1);
+      if (x + 1 < width && y + 1 < height) field[index] = Math.min(field[index], field[index + width + 1] + diagonal);
+      if (x > 0 && y + 1 < height) field[index] = Math.min(field[index], field[index + width - 1] + diagonal);
+    }
+  }
+  return field;
 }
 
 function colorDistance(
@@ -120,21 +230,28 @@ function colorDistance(
   );
 }
 
-function setGeometryColor(
-  geometry: THREE.BufferGeometry,
-  red: number,
-  green: number,
-  blue: number,
-) {
-  const count = geometry.getAttribute("position").count;
-  const values = new Float32Array(count * 3);
-  const color = new THREE.Color(red / 255, green / 255, blue / 255);
-  for (let index = 0; index < count; index += 1) {
-    values[index * 3] = color.r;
-    values[index * 3 + 1] = color.g;
-    values[index * 3 + 2] = color.b;
+function getRepresentativeColor(samples: PixelSample[]) {
+  const buckets = new Map<number, { count: number; red: number; green: number; blue: number }>();
+  for (const sample of samples) {
+    const brightness = sample.red * 0.299 + sample.green * 0.587 + sample.blue * 0.114;
+    if (brightness < 42) continue;
+    const key = (Math.round(sample.red / 24) << 16)
+      | (Math.round(sample.green / 24) << 8)
+      | Math.round(sample.blue / 24);
+    const bucket = buckets.get(key) ?? { count: 0, red: 0, green: 0, blue: 0 };
+    bucket.count += 1;
+    bucket.red += sample.red;
+    bucket.green += sample.green;
+    bucket.blue += sample.blue;
+    buckets.set(key, bucket);
   }
-  geometry.setAttribute("color", new THREE.BufferAttribute(values, 3));
+  const winner = [...buckets.values()].sort((a, b) => b.count - a.count)[0];
+  if (!winner) return new THREE.Color(0.72, 0.62, 0.54);
+  return new THREE.Color(
+    winner.red / winner.count / 255,
+    winner.green / winner.count / 255,
+    winner.blue / winner.count / 255,
+  );
 }
 
 function sampleBackground(data: Uint8ClampedArray, width: number, height: number) {
@@ -157,7 +274,7 @@ function sampleBackground(data: Uint8ClampedArray, width: number, height: number
 function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
   const effectiveResolution = Math.min(
     options.resolution,
-    options.mode === "relief" ? 32 : 48,
+    options.mode === "relief" ? 48 : 64,
   );
   const maxDimension = Math.max(image.naturalWidth, image.naturalHeight);
   const width = Math.max(
@@ -186,6 +303,7 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
   const hasTransparency = transparent / (width * height) > 0.03;
   const background = sampleBackground(pixels, width, height);
   const samples: PixelSample[] = [];
+  const foregroundMask = new Uint8Array(width * height);
   let minX = width;
   let maxX = 0;
   let minY = height;
@@ -204,6 +322,7 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
 
       if (!foreground) continue;
       samples.push({ x, y, red, green, blue });
+      foregroundMask[y * width + x] = 1;
       minX = Math.min(minX, x);
       maxX = Math.max(maxX, x);
       minY = Math.min(minY, y);
@@ -216,15 +335,14 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
   }
 
   const bboxWidth = Math.max(1, maxX - minX);
-  const bboxHeight = Math.max(1, maxY - minY);
   const cell = 3.2 / Math.max(width, height);
+  const distanceField = buildDistanceField(foregroundMask, width, height);
+  const anatomy = inferAnatomyGuides(foregroundMask, width, minX, maxX, minY, maxY);
   const samplesByPart = new Map<PartId, PixelSample[]>();
   for (const part of PARTS) samplesByPart.set(part.id, []);
 
   for (const sample of samples) {
-    const normalizedX = (sample.x - minX) / bboxWidth;
-    const normalizedY = (sample.y - minY) / bboxHeight;
-    samplesByPart.get(classifyCharacterPart(normalizedX, normalizedY))?.push(sample);
+    samplesByPart.get(classifyCharacterPart(sample.x, sample.y, anatomy))?.push(sample);
   }
 
   const model = new THREE.Group();
@@ -236,74 +354,96 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
     const partSamples = samplesByPart.get(partDefinition.id) ?? [];
     if (partSamples.length === 0) continue;
 
-    const partMinX = Math.min(...partSamples.map((sample) => sample.x));
-    const partMaxX = Math.max(...partSamples.map((sample) => sample.x));
-    const partCenterX = (partMinX + partMaxX) / 2;
-    const partRadiusX = Math.max(1, (partMaxX - partMinX) / 2);
-    const geometries: THREE.BufferGeometry[] = [];
-    let partVoxelCount = 0;
+    const depthScale = THREE.MathUtils.mapLinear(options.depth, 0.12, 0.9, 0.42, 1.08);
+    const baseColor = getRepresentativeColor(partSamples);
+    const voxels: VoxelBuild[] = [];
 
     for (const sample of partSamples) {
-      const normalizedRadius = Math.min(1, Math.abs(sample.x - partCenterX) / partRadiusX);
-      const roundProfile = Math.sqrt(Math.max(0.08, 1 - normalizedRadius * normalizedRadius));
-      const requestedLayers = Math.max(
-        2,
-        Math.round((options.depth / cell) * partDefinition.depth * (0.42 + roundProfile * 0.58)),
+      const distance = distanceField[sample.y * width + sample.x];
+      const radius = THREE.MathUtils.clamp(
+        Math.round(distance * partDefinition.depth * depthScale),
+        1,
+        Math.max(2, Math.round(bboxWidth * 0.28)),
       );
 
-      for (let layer = 0; layer < requestedLayers; layer += 1) {
-        const geometry = options.mode === "pixel"
-          ? new THREE.BoxGeometry(cell * 0.92, cell * 0.92, cell * 0.92)
-          : new RoundedBoxGeometry(cell * 0.94, cell * 0.94, cell * 0.94, 2, cell * 0.16);
-        setGeometryColor(geometry, sample.red, sample.green, sample.blue);
-        geometry.translate(
-          (sample.x - (width - 1) / 2) * cell,
-          ((height - 1) / 2 - sample.y) * cell,
-          (layer - (requestedLayers - 1) / 2) * cell,
-        );
-        geometries.push(geometry);
-        partVoxelCount += 1;
+      for (let z = -radius; z <= radius; z += 1) {
+        voxels.push({
+          ...sample,
+          z,
+          front: z === radius,
+          back: z === -radius,
+          rim: distance <= 1.5,
+        });
       }
     }
 
-    const merged = mergeGeometries(geometries, false);
-    geometries.forEach((geometry) => geometry.dispose());
-    if (!merged) continue;
-    merged.computeVertexNormals();
-    merged.computeBoundingBox();
-    merged.computeBoundingSphere();
-
-    const material = new THREE.MeshPhysicalMaterial({
+    const geometry = options.mode === "pixel"
+      ? new THREE.BoxGeometry(cell * 0.84, cell * 0.84, cell * 0.84)
+      : new RoundedBoxGeometry(cell * 0.86, cell * 0.86, cell * 0.86, 2, cell * 0.14);
+    const material = new THREE.MeshStandardMaterial({
       color: 0xffffff,
-      vertexColors: true,
-      roughness: options.mode === "pixel" ? 0.78 : 0.62,
+      roughness: options.mode === "pixel" ? 0.9 : 0.72,
       metalness: 0,
-      clearcoat: options.mode === "relief" ? 0.08 : 0,
-      clearcoatRoughness: 0.86,
-      emissive: 0x000000,
     });
-    const mesh = new THREE.Mesh(merged, material);
+    const mesh = new THREE.InstancedMesh(geometry, material, voxels.length);
     mesh.name = `${partDefinition.id}-voxels`;
+    mesh.userData.partId = partDefinition.id;
+    mesh.userData.cell = cell;
+    mesh.userData.originalMatrices = [] as number[][];
+    mesh.userData.originalColors = [] as number[][];
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
+
+    const matrix = new THREE.Matrix4();
+    const position = new THREE.Vector3();
+    const quaternion = new THREE.Quaternion();
+    const scale = new THREE.Vector3(1, 1, 1);
+    const surfaceColor = new THREE.Color();
+    const sideColor = new THREE.Color();
+    const backColor = baseColor.clone().multiplyScalar(0.9);
+    voxels.forEach((voxel, index) => {
+      position.set(
+        (voxel.x - (width - 1) / 2) * cell,
+        ((height - 1) / 2 - voxel.y) * cell,
+        voxel.z * cell,
+      );
+      matrix.compose(position, quaternion, scale);
+      mesh.setMatrixAt(index, matrix);
+      surfaceColor.setRGB(voxel.red / 255, voxel.green / 255, voxel.blue / 255);
+      sideColor.copy(surfaceColor).lerp(baseColor, 0.58).multiplyScalar(0.84);
+      const color = voxel.front
+        ? surfaceColor
+        : voxel.back
+          ? backColor
+          : voxel.rim
+            ? sideColor
+            : baseColor;
+      mesh.setColorAt(index, color);
+      mesh.userData.originalMatrices.push(matrix.toArray());
+      mesh.userData.originalColors.push(color.toArray());
+    });
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
 
     const partGroup = new THREE.Group();
     partGroup.name = `part:${partDefinition.id}`;
     partGroup.userData.partId = partDefinition.id;
     partGroup.userData.label = partDefinition.label;
-    partGroup.userData.voxels = partVoxelCount;
+    partGroup.userData.voxels = voxels.length;
     partGroup.add(mesh);
     model.add(partGroup);
 
-    voxelCount += partVoxelCount;
-    triangleCount += Math.round(
-      merged.index ? merged.index.count / 3 : merged.getAttribute("position").count / 3,
-    );
+    voxelCount += voxels.length;
+    const trianglesPerVoxel = geometry.index
+      ? geometry.index.count / 3
+      : geometry.getAttribute("position").count / 3;
+    triangleCount += Math.round(trianglesPerVoxel * voxels.length);
   }
 
   model.userData.generation = {
     mode: options.mode,
-    segmentation: "character-auto-v1",
+    segmentation: "silhouette-sdf-inflation-v1",
     sourceWidth: image.naturalWidth,
     sourceHeight: image.naturalHeight,
     sampleWidth: width,
@@ -350,14 +490,14 @@ export function ImageTo3DStudio() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const viewerRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<THREE.Group | null>(null);
-  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const cameraRef = useRef<THREE.OrthographicCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sourceImageRef = useRef<HTMLImageElement | null>(null);
   const spinRef = useRef(false);
 
   const [mode, setMode] = useState<GenerationMode>("pixel");
-  const [resolution, setResolution] = useState(42);
+  const [resolution, setResolution] = useState(56);
   const [depth, setDepth] = useState(0.42);
   const [threshold, setThreshold] = useState(52);
   const [activeView, setActiveView] = useState<ViewName>("front");
@@ -370,7 +510,9 @@ export function ImageTo3DStudio() {
   const [exporting, setExporting] = useState(false);
   const [parts, setParts] = useState<PartSummary[]>([]);
   const [selectedPartId, setSelectedPartId] = useState<PartId | null>(null);
+  const [selectedVoxel, setSelectedVoxel] = useState<SelectedVoxel | null>(null);
   const [partColor, setPartColor] = useState("#ffffff");
+  const [voxelColor, setVoxelColor] = useState("#ffffff");
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -380,8 +522,7 @@ export function ImageTo3DStudio() {
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.05;
+    renderer.toneMapping = THREE.NoToneMapping;
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     rendererRef.current = renderer;
@@ -389,8 +530,8 @@ export function ImageTo3DStudio() {
     const scene = new THREE.Scene();
     scene.fog = new THREE.Fog(0x0c1116, 8, 13);
 
-    const camera = new THREE.PerspectiveCamera(34, 1, 0.01, 40);
-    camera.position.set(0, 0.05, 5.5);
+    const camera = new THREE.OrthographicCamera(-2.3, 2.3, 2.3, -2.3, 0.01, 40);
+    camera.position.set(0, 0.05, 6.5);
     cameraRef.current = camera;
 
     const controls = new OrbitControls(camera, canvas);
@@ -407,18 +548,18 @@ export function ImageTo3DStudio() {
     scene.add(root);
     rootRef.current = root;
 
-    const key = new THREE.DirectionalLight(0xffe5d2, 4.6);
+    const key = new THREE.DirectionalLight(0xffe5d2, 1.15);
     key.position.set(-3.5, 5, 5);
     key.castShadow = true;
     key.shadow.mapSize.set(1024, 1024);
     scene.add(key);
-    const fill = new THREE.DirectionalLight(0xa9c8ff, 2.1);
+    const fill = new THREE.DirectionalLight(0xa9c8ff, 0.32);
     fill.position.set(4, 1.5, 3);
     scene.add(fill);
-    const rim = new THREE.DirectionalLight(0xa8ffcf, 2.5);
+    const rim = new THREE.DirectionalLight(0xa8ffcf, 0.48);
     rim.position.set(1, 3, -5);
     scene.add(rim);
-    scene.add(new THREE.HemisphereLight(0xe8f4ff, 0x1b222a, 1.5));
+    scene.add(new THREE.HemisphereLight(0xe8f4ff, 0x1b222a, 0.62));
 
     const floor = new THREE.Mesh(
       new THREE.CircleGeometry(3.6, 72),
@@ -429,13 +570,27 @@ export function ImageTo3DStudio() {
     floor.receiveShadow = true;
     scene.add(floor);
 
+    let resizeFrame = 0;
+    let lastWidth = 0;
+    let lastHeight = 0;
     const resize = () => {
       const { width, height } = viewer.getBoundingClientRect();
+      if (Math.abs(width - lastWidth) < 0.5 && Math.abs(height - lastHeight) < 0.5) return;
+      lastWidth = width;
+      lastHeight = height;
       renderer.setSize(Math.max(1, width), Math.max(1, height), false);
-      camera.aspect = Math.max(1, width) / Math.max(1, height);
+      const aspect = Math.max(1, width) / Math.max(1, height);
+      const halfHeight = 2.3;
+      camera.left = -halfHeight * aspect;
+      camera.right = halfHeight * aspect;
+      camera.top = halfHeight;
+      camera.bottom = -halfHeight;
       camera.updateProjectionMatrix();
     };
-    const observer = new ResizeObserver(resize);
+    const observer = new ResizeObserver(() => {
+      window.cancelAnimationFrame(resizeFrame);
+      resizeFrame = window.requestAnimationFrame(resize);
+    });
     observer.observe(viewer);
     resize();
 
@@ -450,7 +605,15 @@ export function ImageTo3DStudio() {
       const hit = raycaster.intersectObject(root, true)[0];
       let target: THREE.Object3D | null = hit?.object ?? null;
       while (target && !target.userData.partId) target = target.parent;
-      if (target?.userData.partId) setSelectedPartId(target.userData.partId as PartId);
+      if (target?.userData.partId) {
+        const partId = target.userData.partId as PartId;
+        setSelectedPartId(partId);
+        if (hit?.object instanceof THREE.InstancedMesh && hit.instanceId !== undefined) {
+          setSelectedVoxel({ partId, instanceId: hit.instanceId });
+        } else {
+          setSelectedVoxel(null);
+        }
+      }
     };
     canvas.addEventListener("pointerup", selectFromCanvas);
 
@@ -464,6 +627,7 @@ export function ImageTo3DStudio() {
 
     return () => {
       observer.disconnect();
+      window.cancelAnimationFrame(resizeFrame);
       canvas.removeEventListener("pointerup", selectFromCanvas);
       renderer.setAnimationLoop(null);
       controls.dispose();
@@ -518,6 +682,7 @@ export function ImageTo3DStudio() {
         const nextParts = summarizeParts(result.group);
         setParts(nextParts);
         setSelectedPartId(nextParts[0]?.id ?? null);
+        setSelectedVoxel(null);
         setPartColor("#ffffff");
         setActiveView("front");
         setStatus(`${result.metrics.parts} partes · ${result.metrics.elements.toLocaleString("pt-BR")} blocos`);
@@ -525,6 +690,7 @@ export function ImageTo3DStudio() {
         setMetrics(EMPTY_METRICS);
         setParts([]);
         setSelectedPartId(null);
+        setSelectedVoxel(null);
         setStatus(error instanceof Error ? error.message : "Falha na geração");
       }
     }, 100);
@@ -554,9 +720,9 @@ export function ImageTo3DStudio() {
     if (!camera || !controls || !root) return;
     root.rotation.set(0, 0, 0);
     const positions: Record<ViewName, [number, number, number]> = {
-      front: [0, 0.05, 5.5],
-      quarter: [4.1, 0.55, 4.5],
-      side: [5.6, 0.05, 0.2],
+      front: [0, 0.05, 6.5],
+      quarter: [4.8, 3.4, 4.8],
+      side: [6.5, 0.05, 0.2],
     };
     camera.position.set(...positions[view]);
     controls.target.set(0, 0, 0.2);
@@ -576,6 +742,12 @@ export function ImageTo3DStudio() {
     return model.getObjectByName(`part:${partId}`) as THREE.Group | null;
   }, []);
 
+  const getPartVoxelMesh = useCallback((partId: PartId | null) => {
+    const group = getPartGroup(partId);
+    const mesh = group?.children.find((child) => child instanceof THREE.InstancedMesh);
+    return mesh instanceof THREE.InstancedMesh ? mesh : null;
+  }, [getPartGroup]);
+
   const refreshParts = useCallback(() => {
     const model = rootRef.current?.children[0];
     if (model instanceof THREE.Group) setParts(summarizeParts(model));
@@ -587,10 +759,9 @@ export function ImageTo3DStudio() {
     model.traverse((object) => {
       if (!(object instanceof THREE.Mesh)) return;
       const material = object.material;
-      if (!(material instanceof THREE.MeshPhysicalMaterial)) return;
-      const partId = object.parent?.userData.partId as PartId | undefined;
-      material.emissive.set(partId === selectedPartId ? 0x183d2a : 0x000000);
-      material.emissiveIntensity = partId === selectedPartId ? 0.42 : 0;
+      if (!(material instanceof THREE.MeshStandardMaterial)) return;
+      material.emissive.set(0x000000);
+      material.emissiveIntensity = 0;
     });
   }, [selectedPartId, parts]);
 
@@ -605,29 +776,83 @@ export function ImageTo3DStudio() {
 
   const recolorPart = useCallback((hex: string) => {
     setPartColor(hex);
-    const group = getPartGroup(selectedPartId);
-    group?.traverse((object) => {
-      if (!(object instanceof THREE.Mesh)) return;
-      const material = object.material;
-      if (!(material instanceof THREE.MeshPhysicalMaterial)) return;
-      material.vertexColors = false;
-      material.color.set(hex);
-      material.needsUpdate = true;
-    });
-  }, [getPartGroup, selectedPartId]);
+    const mesh = getPartVoxelMesh(selectedPartId);
+    if (!mesh) return;
+    const color = new THREE.Color(hex);
+    for (let index = 0; index < mesh.count; index += 1) mesh.setColorAt(index, color);
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  }, [getPartVoxelMesh, selectedPartId]);
 
   const restorePartColors = useCallback(() => {
-    const group = getPartGroup(selectedPartId);
-    group?.traverse((object) => {
-      if (!(object instanceof THREE.Mesh)) return;
-      const material = object.material;
-      if (!(material instanceof THREE.MeshPhysicalMaterial)) return;
-      material.vertexColors = true;
-      material.color.set(0xffffff);
-      material.needsUpdate = true;
+    const mesh = getPartVoxelMesh(selectedPartId);
+    const originals = mesh?.userData.originalColors as number[][] | undefined;
+    if (!mesh || !originals) return;
+    const color = new THREE.Color();
+    originals.forEach((values, index) => {
+      color.fromArray(values);
+      mesh.setColorAt(index, color);
     });
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     setPartColor("#ffffff");
-  }, [getPartGroup, selectedPartId]);
+  }, [getPartVoxelMesh, selectedPartId]);
+
+  useEffect(() => {
+    const mesh = getPartVoxelMesh(selectedVoxel?.partId ?? null);
+    if (!mesh || selectedVoxel === null) return;
+    const color = new THREE.Color();
+    mesh.getColorAt(selectedVoxel.instanceId, color);
+    setVoxelColor(`#${color.getHexString()}`);
+  }, [getPartVoxelMesh, selectedVoxel]);
+
+  const recolorVoxel = useCallback((hex: string) => {
+    setVoxelColor(hex);
+    const mesh = getPartVoxelMesh(selectedVoxel?.partId ?? null);
+    if (!mesh || selectedVoxel === null) return;
+    mesh.setColorAt(selectedVoxel.instanceId, new THREE.Color(hex));
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  }, [getPartVoxelMesh, selectedVoxel]);
+
+  const nudgeVoxel = useCallback((axis: "x" | "y" | "z", direction: -1 | 1) => {
+    const mesh = getPartVoxelMesh(selectedVoxel?.partId ?? null);
+    if (!mesh || selectedVoxel === null) return;
+    const matrix = new THREE.Matrix4();
+    const position = new THREE.Vector3();
+    const quaternion = new THREE.Quaternion();
+    const scale = new THREE.Vector3();
+    mesh.getMatrixAt(selectedVoxel.instanceId, matrix);
+    matrix.decompose(position, quaternion, scale);
+    position[axis] += Number(mesh.userData.cell ?? 0.08) * direction;
+    matrix.compose(position, quaternion, scale);
+    mesh.setMatrixAt(selectedVoxel.instanceId, matrix);
+    mesh.instanceMatrix.needsUpdate = true;
+  }, [getPartVoxelMesh, selectedVoxel]);
+
+  const restoreVoxel = useCallback(() => {
+    const mesh = getPartVoxelMesh(selectedVoxel?.partId ?? null);
+    const originals = mesh?.userData.originalMatrices as number[][] | undefined;
+    const colors = mesh?.userData.originalColors as number[][] | undefined;
+    if (!mesh || selectedVoxel === null || !originals?.[selectedVoxel.instanceId]) return;
+    mesh.setMatrixAt(selectedVoxel.instanceId, new THREE.Matrix4().fromArray(originals[selectedVoxel.instanceId]));
+    if (colors?.[selectedVoxel.instanceId]) {
+      mesh.setColorAt(selectedVoxel.instanceId, new THREE.Color().fromArray(colors[selectedVoxel.instanceId]));
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+  }, [getPartVoxelMesh, selectedVoxel]);
+
+  const removeVoxel = useCallback(() => {
+    const mesh = getPartVoxelMesh(selectedVoxel?.partId ?? null);
+    if (!mesh || selectedVoxel === null) return;
+    const matrix = new THREE.Matrix4();
+    const position = new THREE.Vector3();
+    const quaternion = new THREE.Quaternion();
+    const scale = new THREE.Vector3();
+    mesh.getMatrixAt(selectedVoxel.instanceId, matrix);
+    matrix.decompose(position, quaternion, scale);
+    matrix.compose(position, quaternion, scale.setScalar(0));
+    mesh.setMatrixAt(selectedVoxel.instanceId, matrix);
+    mesh.instanceMatrix.needsUpdate = true;
+  }, [getPartVoxelMesh, selectedVoxel]);
 
   const movePart = useCallback((axis: "x" | "y" | "z", value: number) => {
     const group = getPartGroup(selectedPartId);
@@ -682,7 +907,7 @@ export function ImageTo3DStudio() {
           <span>IMAGE<span>→</span>3D</span>
         </div>
         <div className="build-tag">
-          <span className="status-dot" /> editable voxel engine · alpha 0.2
+          <span className="status-dot" /> local silhouette engine · alpha 0.4
         </div>
       </header>
 
@@ -692,8 +917,8 @@ export function ImageTo3DStudio() {
           <h1>Uma imagem entra. <em>Geometria editável sai.</em></h1>
         </div>
         <p className="intro-copy">
-          A imagem é segmentada em cabeça, tronco e membros; cada região recebe
-          camadas reais de blocos e continua selecionável depois da geração.
+          A silhueta é inflada como um campo 3D: a frente preserva o sprite e o
+          interior forma volume arredondado, sem esticar a imagem para trás.
         </p>
       </section>
 
@@ -739,8 +964,8 @@ export function ImageTo3DStudio() {
               onClick={() => setMode("pixel")}
             >
               <Grid3X3 size={18} />
-              <strong>Blocos voxel</strong>
-              <span>cubos com profundidade</span>
+              <strong>Voxels isolados</strong>
+              <span>cada cubo é editável</span>
             </button>
             <button
               className={`mode-button ${mode === "relief" ? "is-active" : ""}`}
@@ -808,7 +1033,7 @@ export function ImageTo3DStudio() {
           </div>
           <div className="viewer-bottom">
             <div className="viewer-title">
-              <small>live procedural preview</small>
+              <small>local isometric preview</small>
               <strong>{mode === "pixel" ? "Editable voxel character" : "Rounded voxel character"}</strong>
             </div>
             <button
@@ -836,7 +1061,7 @@ export function ImageTo3DStudio() {
                   <button
                     type="button"
                     className="part-select"
-                    onClick={() => setSelectedPartId(part.id)}
+                    onClick={() => { setSelectedPartId(part.id); setSelectedVoxel(null); }}
                   >
                     <span>{part.label}</span>
                     <small>{part.voxels.toLocaleString("pt-BR")} blocos</small>
@@ -905,6 +1130,44 @@ export function ImageTo3DStudio() {
                     <Trash2 size={13} /> Remover
                   </button>
                 </div>
+
+                <div className="voxel-editor">
+                  <div className="voxel-heading">
+                    <strong>{selectedVoxel ? `Voxel #${selectedVoxel.instanceId + 1}` : "Edição por voxel"}</strong>
+                    <span>{selectedVoxel ? "selecionado" : "clique em um cubo"}</span>
+                  </div>
+                  {selectedVoxel ? (
+                    <>
+                      <label className="voxel-color">
+                        Cor individual
+                        <input
+                          type="color"
+                          value={voxelColor}
+                          onChange={(event) => recolorVoxel(event.target.value)}
+                        />
+                      </label>
+                      <div className="voxel-move" aria-label="Mover voxel selecionado">
+                        {(["x", "y", "z"] as const).map((axis) => (
+                          <div key={axis}>
+                            <span>{axis.toUpperCase()}</span>
+                            <button type="button" onClick={() => nudgeVoxel(axis, -1)}>−</button>
+                            <button type="button" onClick={() => nudgeVoxel(axis, 1)}>+</button>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="part-actions">
+                        <button type="button" onClick={restoreVoxel}>
+                          <Undo2 size={13} /> Restaurar voxel
+                        </button>
+                        <button type="button" className="danger-action" onClick={removeVoxel}>
+                          <Trash2 size={13} /> Remover voxel
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <p className="empty-editor">Clique diretamente em um cubo do personagem.</p>
+                  )}
+                </div>
               </>
             ) : (
               <p className="empty-editor">Clique em uma parte no modelo ou na lista.</p>
@@ -920,8 +1183,8 @@ export function ImageTo3DStudio() {
           <div>
             <div className="divider" />
             <div className="editor-tip">
-              Clique no corpo para selecionar. Cor, posição e visibilidade são
-              preservadas no GLB exportado.
+              Clique em um cubo para editar aquele voxel. Cor, posição e
+              visibilidade são preservadas no GLB exportado.
             </div>
             <button
               className="export-button"
@@ -947,17 +1210,17 @@ export function ImageTo3DStudio() {
         <article className="workflow-step">
           <span>02 / SEGMENT</span>
           <h3>Corpo dividido</h3>
-          <p>Cabeça, tronco, braços, mãos, pernas e pés viram grupos independentes.</p>
+          <p>A máscara e as proporções inferem cabeça, tronco, braços, mãos, pernas e pés.</p>
         </article>
         <article className="workflow-step">
           <span>03 / BUILD</span>
-          <h3>Volume em blocos</h3>
-          <p>Camadas voxel formam frente, laterais e costas com perfil arredondado.</p>
+          <h3>Corpo voxel completo</h3>
+          <p>Um campo de distância transforma o contorno em volume sólido, sem placas repetidas.</p>
         </article>
         <article className="workflow-step">
           <span>04 / EDIT + SHIP</span>
           <h3>GLB ainda editável</h3>
-          <p>Recolora, reposicione ou remova partes antes de abrir no seu pipeline.</p>
+          <p>Recolora, mova ou remova partes e voxels individuais antes de exportar.</p>
         </article>
       </section>
     </main>

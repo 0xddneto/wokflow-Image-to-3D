@@ -647,6 +647,84 @@ input[type="range"]::-webkit-slider-thumb {
   color: #ff9b79;
 }
 
+.voxel-editor {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid #28323c;
+}
+
+.voxel-heading,
+.voxel-color {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.voxel-heading strong {
+  color: #dce4eb;
+  font-size: 10px;
+}
+
+.voxel-heading span,
+.voxel-color {
+  color: #77838f;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 8px;
+  text-transform: uppercase;
+}
+
+.voxel-color {
+  margin-top: 12px;
+  min-height: 34px;
+  padding: 0 9px;
+  border: 1px solid #2b3540;
+  background: #131920;
+}
+
+.voxel-color input {
+  width: 25px;
+  height: 25px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.voxel-move {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 7px;
+  margin-top: 8px;
+}
+
+.voxel-move div {
+  display: grid;
+  grid-template-columns: 1fr 28px 28px;
+  align-items: center;
+  min-height: 32px;
+  border: 1px solid #2b3540;
+  background: #10161c;
+}
+
+.voxel-move span {
+  padding-left: 8px;
+  color: var(--acid);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 9px;
+}
+
+.voxel-move button {
+  height: 100%;
+  border-left: 1px solid #2b3540;
+  color: #aeb8c1;
+  cursor: pointer;
+}
+
+.voxel-move button:hover {
+  color: var(--acid);
+  background: #19232a;
+}
+
 .compact-metrics {
   display: flex;
   flex-wrap: wrap;
