@@ -26,6 +26,7 @@ type ViewName = "front" | "quarter" | "side";
 type Metrics = {
   source: string;
   grid: string;
+  sourcePixels: number;
   elements: number;
   triangles: number;
   parts: number;
@@ -109,6 +110,7 @@ type BuildOptions = {
 const EMPTY_METRICS: Metrics = {
   source: "—",
   grid: "—",
+  sourcePixels: 0,
   elements: 0,
   triangles: 0,
   parts: 0,
@@ -246,11 +248,12 @@ function getRepresentativeColor(samples: PixelSample[]) {
     buckets.set(key, bucket);
   }
   const winner = [...buckets.values()].sort((a, b) => b.count - a.count)[0];
-  if (!winner) return new THREE.Color(0.72, 0.62, 0.54);
-  return new THREE.Color(
+  if (!winner) return new THREE.Color().setRGB(0.72, 0.62, 0.54, THREE.SRGBColorSpace);
+  return new THREE.Color().setRGB(
     winner.red / winner.count / 255,
     winner.green / winner.count / 255,
     winner.blue / winner.count / 255,
+    THREE.SRGBColorSpace,
   );
 }
 
@@ -272,11 +275,12 @@ function sampleBackground(data: Uint8ClampedArray, width: number, height: number
 }
 
 function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
+  const maxDimension = Math.max(image.naturalWidth, image.naturalHeight);
   const effectiveResolution = Math.min(
     options.resolution,
-    options.mode === "relief" ? 48 : 64,
+    maxDimension,
+    options.mode === "relief" ? 64 : 128,
   );
-  const maxDimension = Math.max(image.naturalWidth, image.naturalHeight);
   const width = Math.max(
     2,
     Math.round((image.naturalWidth / maxDimension) * effectiveResolution),
@@ -378,13 +382,15 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
     }
 
     const geometry = options.mode === "pixel"
-      ? new THREE.BoxGeometry(cell * 0.84, cell * 0.84, cell * 0.84)
-      : new RoundedBoxGeometry(cell * 0.86, cell * 0.86, cell * 0.86, 2, cell * 0.14);
-    const material = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: options.mode === "pixel" ? 0.9 : 0.72,
-      metalness: 0,
-    });
+      ? new THREE.BoxGeometry(cell * 0.72, cell * 0.72, cell * 0.72)
+      : new RoundedBoxGeometry(cell * 0.82, cell * 0.82, cell * 0.82, 2, cell * 0.14);
+    const material = options.mode === "pixel"
+      ? new THREE.MeshBasicMaterial({ color: 0xffffff })
+      : new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        roughness: 0.72,
+        metalness: 0,
+      });
     const mesh = new THREE.InstancedMesh(geometry, material, voxels.length);
     mesh.name = `${partDefinition.id}-voxels`;
     mesh.userData.partId = partDefinition.id;
@@ -410,7 +416,12 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
       );
       matrix.compose(position, quaternion, scale);
       mesh.setMatrixAt(index, matrix);
-      surfaceColor.setRGB(voxel.red / 255, voxel.green / 255, voxel.blue / 255);
+      surfaceColor.setRGB(
+        voxel.red / 255,
+        voxel.green / 255,
+        voxel.blue / 255,
+        THREE.SRGBColorSpace,
+      );
       sideColor.copy(surfaceColor).lerp(baseColor, 0.58).multiplyScalar(0.84);
       const color = voxel.front
         ? surfaceColor
@@ -443,7 +454,7 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
 
   model.userData.generation = {
     mode: options.mode,
-    segmentation: "silhouette-sdf-inflation-v1",
+    segmentation: "native-pixel-silhouette-sdf-v2",
     sourceWidth: image.naturalWidth,
     sourceHeight: image.naturalHeight,
     sampleWidth: width,
@@ -456,6 +467,7 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
     metrics: {
       source: `${image.naturalWidth}×${image.naturalHeight}`,
       grid: `${width}×${height}`,
+      sourcePixels: samples.length,
       elements: voxelCount,
       triangles: triangleCount,
       parts: model.children.length,
@@ -497,7 +509,7 @@ export function ImageTo3DStudio() {
   const spinRef = useRef(false);
 
   const [mode, setMode] = useState<GenerationMode>("pixel");
-  const [resolution, setResolution] = useState(56);
+  const [resolution, setResolution] = useState(128);
   const [depth, setDepth] = useState(0.42);
   const [threshold, setThreshold] = useState(52);
   const [activeView, setActiveView] = useState<ViewName>("front");
@@ -685,7 +697,9 @@ export function ImageTo3DStudio() {
         setSelectedVoxel(null);
         setPartColor("#ffffff");
         setActiveView("front");
-        setStatus(`${result.metrics.parts} partes · ${result.metrics.elements.toLocaleString("pt-BR")} blocos`);
+        setStatus(
+          `${result.metrics.sourcePixels.toLocaleString("pt-BR")} pixels preservados · ${result.metrics.elements.toLocaleString("pt-BR")} voxels 3D`,
+        );
       } catch (error) {
         setMetrics(EMPTY_METRICS);
         setParts([]);
@@ -964,8 +978,8 @@ export function ImageTo3DStudio() {
               onClick={() => setMode("pixel")}
             >
               <Grid3X3 size={18} />
-              <strong>Voxels isolados</strong>
-              <span>cada cubo é editável</span>
+              <strong>Pixel nativo</strong>
+              <span>1 pixel = 1 cubo frontal</span>
             </button>
             <button
               className={`mode-button ${mode === "relief" ? "is-active" : ""}`}
@@ -981,11 +995,11 @@ export function ImageTo3DStudio() {
           <div className="divider" />
           <div className="sliders">
             <label className="slider-row">
-              <span className="slider-label">Resolução <output>{resolution}</output></span>
+              <span className="slider-label">Grade de pixels <output>{resolution}</output></span>
               <input
                 type="range"
-                min="18"
-                max="58"
+                min="32"
+                max="128"
                 value={resolution}
                 onChange={(event) => setResolution(Number(event.target.value))}
               />
@@ -1064,7 +1078,7 @@ export function ImageTo3DStudio() {
                     onClick={() => { setSelectedPartId(part.id); setSelectedVoxel(null); }}
                   >
                     <span>{part.label}</span>
-                    <small>{part.voxels.toLocaleString("pt-BR")} blocos</small>
+                    <small>{part.voxels.toLocaleString("pt-BR")} voxels</small>
                   </button>
                   <button
                     type="button"
@@ -1176,7 +1190,8 @@ export function ImageTo3DStudio() {
 
           <div className="compact-metrics">
             <span>{metrics.parts} partes</span>
-            <span>{metrics.elements.toLocaleString("pt-BR")} blocos</span>
+            <span>{(metrics.sourcePixels ?? 0).toLocaleString("pt-BR")} pixels frontais</span>
+            <span>{metrics.elements.toLocaleString("pt-BR")} voxels</span>
             <span>{metrics.triangles.toLocaleString("pt-BR")} tris</span>
           </div>
 
@@ -1214,8 +1229,8 @@ export function ImageTo3DStudio() {
         </article>
         <article className="workflow-step">
           <span>03 / BUILD</span>
-          <h3>Corpo voxel completo</h3>
-          <p>Um campo de distância transforma o contorno em volume sólido, sem placas repetidas.</p>
+          <h3>Frente pixel a pixel</h3>
+          <p>A grade nativa preserva cada pixel da imagem como um cubo frontal separado.</p>
         </article>
         <article className="workflow-step">
           <span>04 / EDIT + SHIP</span>

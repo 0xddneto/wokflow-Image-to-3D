@@ -34,7 +34,7 @@ test("server-renders the Image to 3D studio", async () => {
   const html = await response.text();
   assert.match(html, /<title>Image to 3D — Procedural Asset Studio<\/title>/i);
   assert.match(html, /Uma imagem entra/);
-  assert.match(html, /Voxels isolados/);
+  assert.match(html, /Pixel nativo/);
   assert.match(html, /Partes/);
   assert.match(html, /Selecione uma parte/);
   assert.match(html, /Exportar GLB/);

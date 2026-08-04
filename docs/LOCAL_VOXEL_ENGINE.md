@@ -32,9 +32,10 @@ roda no navegador sem servidor, token ou GPU dedicada.
 ## Resultado verificado com a base MOB
 
 - Entrada: 128 x 128 RGBA.
-- Grade padrão: 56.
-- Saída: 5.447 voxels individuais em 12 partes.
-- GLB exportado: 1.081.260 bytes.
+- Grade padrão: 128, preservando pixel a pixel a base nativa de 128×128.
+- Frente: 4.787 pixels opacos preservados como 4.787 cubos frontais separados.
+- Saída volumétrica: 52.961 voxels individuais em 12 partes.
+- GLB exportado: 9.209.288 bytes.
 - Frente, perfil e vista 3/4 verificadas no navegador.
 - Build e testes do site aprovados.
 
