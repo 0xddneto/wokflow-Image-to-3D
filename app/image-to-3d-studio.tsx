@@ -1,16 +1,26 @@
 "use client";
 
 import {
+  BoxSelect,
+  Circle,
   Download,
+  Eraser,
   Grid3X3,
+  LassoSelect,
+  Minus,
   Move3D,
+  PaintBucket,
   Palette,
+  Pencil,
+  Pipette,
   RotateCw,
   ShieldCheck,
+  Square,
   Sparkles,
   Trash2,
   Undo2,
   UploadCloud,
+  Wand2,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
@@ -20,6 +30,7 @@ import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeom
 
 type GenerationMode = "pixel" | "relief";
 type ViewName = "front" | "quarter" | "side";
+type PixelTool = "pencil" | "eraser" | "fill" | "eyedropper" | "box-select" | "wand" | "lasso" | "line" | "rectangle" | "circle";
 
 type Metrics = {
   source: string;
@@ -105,6 +116,19 @@ const EMPTY_METRICS: Metrics = {
   triangles: 0,
   parts: 0,
 };
+
+const PIXEL_TOOLS = [
+  { id: "pencil", label: "Lápis", icon: Pencil },
+  { id: "eraser", label: "Borracha", icon: Eraser },
+  { id: "fill", label: "Balde de tinta", icon: PaintBucket },
+  { id: "eyedropper", label: "Conta-gotas", icon: Pipette },
+  { id: "box-select", label: "Seleção retangular", icon: BoxSelect },
+  { id: "wand", label: "Varinha de seleção", icon: Wand2 },
+  { id: "lasso", label: "Laço", icon: LassoSelect },
+  { id: "line", label: "Linha", icon: Minus },
+  { id: "rectangle", label: "Retângulo", icon: Square },
+  { id: "circle", label: "Círculo", icon: Circle },
+] satisfies Array<{ id: PixelTool; label: string; icon: typeof Pencil }>;
 
 function inferAnatomyGuides(
   mask: Uint8Array,
@@ -388,6 +412,9 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
     mesh.userData.originalMatrices = [] as number[][];
     mesh.userData.originalColors = [] as number[][];
     mesh.userData.currentColors = [] as number[][];
+    mesh.userData.frontInstanceIds = [] as number[];
+    mesh.userData.pixelCoordinates = [] as Array<[number, number, number, number]>;
+    mesh.userData.renderPixelSize = options.mode === "pixel" ? 0.72 : 0.82;
     mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
@@ -425,6 +452,8 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
       mesh.userData.originalMatrices.push(matrix.toArray());
       mesh.userData.originalColors.push(color.toArray());
       mesh.userData.currentColors.push(color.toArray());
+      if (voxel.front) mesh.userData.frontInstanceIds.push(index);
+      mesh.userData.pixelCoordinates.push([voxel.x, voxel.y, voxel.z, voxel.front ? 1 : 0]);
     });
     mesh.instanceMatrix.needsUpdate = true;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
@@ -500,6 +529,13 @@ export function ImageTo3DStudio() {
   const [exporting, setExporting] = useState(false);
   const [selectedPixels, setSelectedPixels] = useState<SelectedPixel[]>([]);
   const [selectionColor, setSelectionColor] = useState("#ffffff");
+  const [activeTool, setActiveTool] = useState<PixelTool | null>("box-select");
+  const [pixelSize, setPixelSize] = useState(0.72);
+  const activeToolRef = useRef<PixelTool | null>(activeTool);
+  const selectionColorRef = useRef(selectionColor);
+
+  useEffect(() => { activeToolRef.current = activeTool; }, [activeTool]);
+  useEffect(() => { selectionColorRef.current = selectionColor; }, [selectionColor]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -583,34 +619,255 @@ export function ImageTo3DStudio() {
 
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
-    const selectFromCanvas = (event: PointerEvent) => {
-      if (Math.abs(event.movementX) > 3 || Math.abs(event.movementY) > 3) return;
-      const rect = canvas.getBoundingClientRect();
+    let pointerDownPosition: { x: number; y: number } | null = null;
+    let dragPath: Array<{ x: number; y: number }> = [];
+    const strokePixels = new Map<string, SelectedPixel>();
+    const pixelKey = (pixel: SelectedPixel) => `${pixel.partId}:${pixel.instanceId}`;
+    const getMesh = (partId: PartId) => {
+      const group = root.children[0]?.getObjectByName(`part:${partId}`);
+      const mesh = group?.children.find((child) => child instanceof THREE.InstancedMesh);
+      return mesh instanceof THREE.InstancedMesh ? mesh : null;
+    };
+    const projectFrontPixels = (rect: DOMRect) => {
+      const projected: Array<SelectedPixel & { screenX: number; screenY: number; x: number; y: number }> = [];
+      const instanceMatrix = new THREE.Matrix4();
+      const worldMatrix = new THREE.Matrix4();
+      const position = new THREE.Vector3();
+      root.updateMatrixWorld(true);
+      camera.updateMatrixWorld(true);
+      root.traverse((object) => {
+        if (!(object instanceof THREE.InstancedMesh)) return;
+        const partId = object.userData.partId as PartId | undefined;
+        const frontInstanceIds = object.userData.frontInstanceIds as number[] | undefined;
+        const coordinates = object.userData.pixelCoordinates as Array<[number, number, number, number]> | undefined;
+        if (!partId || !frontInstanceIds || !coordinates) return;
+        for (const instanceId of frontInstanceIds) {
+          object.getMatrixAt(instanceId, instanceMatrix);
+          worldMatrix.multiplyMatrices(object.matrixWorld, instanceMatrix);
+          position.setFromMatrixPosition(worldMatrix).project(camera);
+          const coordinate = coordinates[instanceId];
+          projected.push({
+            partId,
+            instanceId,
+            screenX: rect.left + (position.x + 1) * rect.width * 0.5,
+            screenY: rect.top + (1 - position.y) * rect.height * 0.5,
+            x: coordinate[0],
+            y: coordinate[1],
+          });
+        }
+      });
+      return projected;
+    };
+    const findNearestFrontPixel = (event: PointerEvent, rect: DOMRect) => {
+      let nearest: SelectedPixel | null = null;
+      let nearestDistance = 9 * 9;
+      for (const pixel of projectFrontPixels(rect)) {
+        const distance = (pixel.screenX - event.clientX) ** 2 + (pixel.screenY - event.clientY) ** 2;
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearest = { partId: pixel.partId, instanceId: pixel.instanceId };
+        }
+      }
+      return nearest;
+    };
+    const pickPixel = (event: PointerEvent, rect: DOMRect) => {
       pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
       pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
       raycaster.setFromCamera(pointer, camera);
       const hit = raycaster.intersectObject(root, true)[0];
       let target: THREE.Object3D | null = hit?.object ?? null;
       while (target && !target.userData.partId) target = target.parent;
-      if (target?.userData.partId && hit?.object instanceof THREE.InstancedMesh && hit.instanceId !== undefined) {
-        const partId = target.userData.partId as PartId;
-        const clicked = { partId, instanceId: hit.instanceId } satisfies SelectedPixel;
+      return target?.userData.partId && hit?.object instanceof THREE.InstancedMesh && hit.instanceId !== undefined
+        ? { partId: target.userData.partId as PartId, instanceId: hit.instanceId }
+        : findNearestFrontPixel(event, rect);
+    };
+    const setSelection = (pixels: SelectedPixel[], additive: boolean) => {
+      setSelectedPixels((previous) => {
+        if (!additive) return pixels;
+        const merged = new Map(previous.map((pixel) => [pixelKey(pixel), pixel]));
+        pixels.forEach((pixel) => merged.set(pixelKey(pixel), pixel));
+        return [...merged.values()];
+      });
+    };
+    const paintPixels = (pixels: SelectedPixel[], hex: string) => {
+      const dirty = new Set<THREE.InstancedMesh>();
+      const color = new THREE.Color(hex);
+      for (const pixel of pixels) {
+        const mesh = getMesh(pixel.partId);
+        const current = mesh?.userData.currentColors as number[][] | undefined;
+        if (!mesh || !current) continue;
+        current[pixel.instanceId] = color.toArray();
+        mesh.setColorAt(pixel.instanceId, color);
+        dirty.add(mesh);
+      }
+      dirty.forEach((mesh) => { if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true; });
+    };
+    const erasePixels = (pixels: SelectedPixel[]) => {
+      const dirty = new Set<THREE.InstancedMesh>();
+      const matrix = new THREE.Matrix4();
+      const position = new THREE.Vector3();
+      const quaternion = new THREE.Quaternion();
+      const scale = new THREE.Vector3();
+      for (const pixel of pixels) {
+        const mesh = getMesh(pixel.partId);
+        if (!mesh) continue;
+        mesh.getMatrixAt(pixel.instanceId, matrix);
+        matrix.decompose(position, quaternion, scale);
+        mesh.setMatrixAt(pixel.instanceId, matrix.compose(position, quaternion, scale.setScalar(0)));
+        dirty.add(mesh);
+      }
+      dirty.forEach((mesh) => { mesh.instanceMatrix.needsUpdate = true; });
+    };
+    const currentColorKey = (pixel: SelectedPixel) => {
+      const values = getMesh(pixel.partId)?.userData.currentColors?.[pixel.instanceId] as number[] | undefined;
+      return values?.map((value) => value.toFixed(5)).join(":") ?? "";
+    };
+    const clickSelection = (clicked: SelectedPixel, additive: boolean) => {
+      if (!additive) {
+        setSelectedPixels([clicked]);
+      } else {
         setSelectedPixels((previous) => {
-          if (!event.shiftKey) return [clicked];
-          const exists = previous.some(
-            (pixel) => pixel.partId === clicked.partId && pixel.instanceId === clicked.instanceId,
-          );
+          const exists = previous.some((pixel) => pixelKey(pixel) === pixelKey(clicked));
           return exists
-            ? previous.filter(
-              (pixel) => pixel.partId !== clicked.partId || pixel.instanceId !== clicked.instanceId,
-            )
+            ? previous.filter((pixel) => pixelKey(pixel) !== pixelKey(clicked))
             : [...previous, clicked];
         });
-      } else if (!event.shiftKey) {
-        setSelectedPixels([]);
       }
     };
-    canvas.addEventListener("pointerup", selectFromCanvas);
+    const beginTool = (event: PointerEvent) => {
+      const tool = activeToolRef.current;
+      if (!tool) return;
+      pointerDownPosition = { x: event.clientX, y: event.clientY };
+      dragPath = [{ x: event.clientX, y: event.clientY }];
+      strokePixels.clear();
+      controls.enabled = false;
+      canvas.setPointerCapture(event.pointerId);
+      if (tool !== "pencil" && tool !== "eraser") return;
+      const clicked = pickPixel(event, canvas.getBoundingClientRect());
+      if (!clicked) return;
+      strokePixels.set(pixelKey(clicked), clicked);
+      if (tool === "pencil") paintPixels([clicked], selectionColorRef.current);
+      else erasePixels([clicked]);
+    };
+    const continueTool = (event: PointerEvent) => {
+      if (!pointerDownPosition) return;
+      dragPath.push({ x: event.clientX, y: event.clientY });
+      const tool = activeToolRef.current;
+      if (tool !== "pencil" && tool !== "eraser") return;
+      const clicked = pickPixel(event, canvas.getBoundingClientRect());
+      if (!clicked || strokePixels.has(pixelKey(clicked))) return;
+      strokePixels.set(pixelKey(clicked), clicked);
+      if (tool === "pencil") paintPixels([clicked], selectionColorRef.current);
+      else erasePixels([clicked]);
+    };
+    const finishTool = (event: PointerEvent) => {
+      const start = pointerDownPosition;
+      pointerDownPosition = null;
+      controls.enabled = true;
+      if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+      if (!start) return;
+      const tool = activeToolRef.current;
+      if (tool === "pencil" || tool === "eraser") {
+        const stroke = [...strokePixels.values()];
+        setSelection(stroke, event.shiftKey);
+        setStatus(tool === "pencil" ? `${stroke.length} pixels pintados` : `${stroke.length} pixels apagados`);
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      const clicked = pickPixel(event, rect);
+      const projected = projectFrontPixels(rect);
+      const minX = Math.min(start.x, event.clientX);
+      const maxX = Math.max(start.x, event.clientX);
+      const minY = Math.min(start.y, event.clientY);
+      const maxY = Math.max(start.y, event.clientY);
+      const moved = Math.hypot(event.clientX - start.x, event.clientY - start.y);
+      if (tool === "box-select") {
+        if (moved < 4 && clicked) clickSelection(clicked, event.shiftKey);
+        else setSelection(projected.filter((pixel) => pixel.screenX >= minX && pixel.screenX <= maxX && pixel.screenY >= minY && pixel.screenY <= maxY), event.shiftKey);
+        setStatus("Seleção de pixels atualizada");
+        return;
+      }
+      if (!clicked && (tool === "fill" || tool === "eyedropper" || tool === "wand")) return;
+      if (tool === "eyedropper" && clicked) {
+        const values = getMesh(clicked.partId)?.userData.currentColors?.[clicked.instanceId] as number[] | undefined;
+        if (values) setSelectionColor(`#${new THREE.Color().fromArray(values).getHexString(THREE.SRGBColorSpace)}`);
+        setSelectedPixels([clicked]);
+        setStatus("Cor capturada");
+        return;
+      }
+      if (tool === "wand" && clicked) {
+        const key = currentColorKey(clicked);
+        setSelection(projected.filter((pixel) => currentColorKey(pixel) === key), event.shiftKey);
+        setStatus("Pixels da mesma cor selecionados");
+        return;
+      }
+      if (tool === "fill" && clicked) {
+        const key = currentColorKey(clicked);
+        const byCoordinate = new Map(projected.map((pixel) => [`${pixel.x}:${pixel.y}`, pixel]));
+        const startPixel = projected.find((pixel) => pixelKey(pixel) === pixelKey(clicked));
+        const filled: SelectedPixel[] = [];
+        const queue = startPixel ? [startPixel] : [];
+        const seen = new Set<string>();
+        while (queue.length) {
+          const pixel = queue.pop()!;
+          const coordinateKey = `${pixel.x}:${pixel.y}`;
+          if (seen.has(coordinateKey) || currentColorKey(pixel) !== key) continue;
+          seen.add(coordinateKey);
+          filled.push(pixel);
+          for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            const neighbor = byCoordinate.get(`${pixel.x + dx}:${pixel.y + dy}`);
+            if (neighbor) queue.push(neighbor);
+          }
+        }
+        paintPixels(filled, selectionColorRef.current);
+        setSelectedPixels(filled);
+        setStatus(`${filled.length} pixels preenchidos`);
+        return;
+      }
+      let affected: SelectedPixel[] = [];
+      const threshold = Math.max(3, rect.height / 150);
+      if (tool === "lasso") {
+        const path = dragPath;
+        const inside = (x: number, y: number) => {
+          let result = false;
+          for (let i = 0, j = path.length - 1; i < path.length; j = i++) {
+            const a = path[i]; const b = path[j];
+            if ((a.y > y) !== (b.y > y) && x < ((b.x - a.x) * (y - a.y)) / (b.y - a.y || 1) + a.x) result = !result;
+          }
+          return result;
+        };
+        affected = moved < 4 && clicked ? [clicked] : projected.filter((pixel) => inside(pixel.screenX, pixel.screenY));
+        setSelection(affected, event.shiftKey);
+        setStatus("Seleção por laço atualizada");
+        return;
+      }
+      const distanceToLine = (x: number, y: number) => {
+        const dx = event.clientX - start.x; const dy = event.clientY - start.y;
+        const lengthSquared = dx * dx + dy * dy || 1;
+        const t = Math.max(0, Math.min(1, ((x - start.x) * dx + (y - start.y) * dy) / lengthSquared));
+        return Math.hypot(x - (start.x + t * dx), y - (start.y + t * dy));
+      };
+      if (tool === "line") affected = projected.filter((pixel) => distanceToLine(pixel.screenX, pixel.screenY) <= threshold);
+      if (tool === "rectangle") affected = projected.filter((pixel) => pixel.screenX >= minX && pixel.screenX <= maxX && pixel.screenY >= minY && pixel.screenY <= maxY && Math.min(pixel.screenX - minX, maxX - pixel.screenX, pixel.screenY - minY, maxY - pixel.screenY) <= threshold);
+      if (tool === "circle") {
+        const centerX = (minX + maxX) / 2; const centerY = (minY + maxY) / 2;
+        const radiusX = Math.max(1, (maxX - minX) / 2); const radiusY = Math.max(1, (maxY - minY) / 2);
+        affected = projected.filter((pixel) => Math.abs(((pixel.screenX - centerX) / radiusX) ** 2 + ((pixel.screenY - centerY) / radiusY) ** 2 - 1) <= threshold / Math.max(radiusX, radiusY) * 2.2);
+      }
+      if (affected.length === 0 && clicked) affected = [clicked];
+      paintPixels(affected, selectionColorRef.current);
+      setSelectedPixels(affected);
+      setStatus(`${affected.length} pixels alterados`);
+    };
+    const cancelTool = (event: PointerEvent) => {
+      pointerDownPosition = null;
+      controls.enabled = true;
+      if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    };
+    canvas.addEventListener("pointerdown", beginTool);
+    canvas.addEventListener("pointermove", continueTool);
+    canvas.addEventListener("pointerup", finishTool);
+    canvas.addEventListener("pointercancel", cancelTool);
 
     const clock = new THREE.Clock();
     renderer.setAnimationLoop(() => {
@@ -623,7 +880,10 @@ export function ImageTo3DStudio() {
     return () => {
       observer.disconnect();
       window.cancelAnimationFrame(resizeFrame);
-      canvas.removeEventListener("pointerup", selectFromCanvas);
+      canvas.removeEventListener("pointerdown", beginTool);
+      canvas.removeEventListener("pointermove", continueTool);
+      canvas.removeEventListener("pointerup", finishTool);
+      canvas.removeEventListener("pointercancel", cancelTool);
       renderer.setAnimationLoop(null);
       controls.dispose();
       if (root.children[0]) disposeObject(root.children[0]);
@@ -728,6 +988,13 @@ export function ImageTo3DStudio() {
     spinRef.current = next;
   };
 
+  const togglePixelTool = useCallback((tool: PixelTool) => {
+    const next = activeTool === tool ? null : tool;
+    activeToolRef.current = next;
+    if (controlsRef.current) controlsRef.current.enabled = true;
+    setActiveTool(next);
+  }, [activeTool]);
+
   const previousSelectionRef = useRef<SelectedPixel[]>([]);
 
   const getPixelMesh = useCallback((partId: PartId) => {
@@ -750,9 +1017,21 @@ export function ImageTo3DStudio() {
     return result;
   }, []);
 
+  useEffect(() => {
+    rootRef.current?.children[0]?.traverse((object) => {
+      if (!(object instanceof THREE.InstancedMesh)) return;
+      const previousSize = Number(object.userData.renderPixelSize ?? 0.72);
+      if (!Number.isFinite(previousSize) || previousSize <= 0 || Math.abs(previousSize - pixelSize) < 0.0001) return;
+      const ratio = pixelSize / previousSize;
+      object.geometry.scale(ratio, ratio, ratio);
+      object.geometry.computeBoundingBox();
+      object.geometry.computeBoundingSphere();
+      object.userData.renderPixelSize = pixelSize;
+    });
+  }, [metrics.elements, pixelSize]);
+
   const renderSelection = useCallback((pixels: SelectedPixel[], highlighted: boolean) => {
     const dirty = new Set<THREE.InstancedMesh>();
-    const highlight = new THREE.Color("#54ffb0");
     const color = new THREE.Color();
     for (const pixel of pixels) {
       const mesh = getPixelMesh(pixel.partId);
@@ -760,7 +1039,7 @@ export function ImageTo3DStudio() {
       const values = currentColors?.[pixel.instanceId];
       if (!mesh || !values) continue;
       color.fromArray(values);
-      if (highlighted) color.lerp(highlight, 0.58);
+      if (highlighted) color.offsetHSL(0, 0, 0.13);
       mesh.setColorAt(pixel.instanceId, color);
       dirty.add(mesh);
     }
@@ -799,6 +1078,12 @@ export function ImageTo3DStudio() {
     }
     renderSelection(selectedPixels, true);
   }, [getPixelMesh, renderSelection, selectedPixels]);
+
+  const changeActiveColor = useCallback((hex: string) => {
+    selectionColorRef.current = hex;
+    if (selectedPixels.length > 0) recolorSelection(hex);
+    else setSelectionColor(hex);
+  }, [recolorSelection, selectedPixels.length]);
 
   const nudgeSelection = useCallback((axis: "x" | "y" | "z", direction: -1 | 1) => {
     const dirty = new Set<THREE.InstancedMesh>();
@@ -1025,7 +1310,7 @@ export function ImageTo3DStudio() {
           </div>
         </aside>
 
-        <div className="viewer" ref={viewerRef}>
+        <div className={`viewer ${activeTool ? "is-editing" : "is-navigating"}`} ref={viewerRef}>
           <canvas ref={canvasRef} aria-label="Visualização tridimensional gerada" />
           <div className="viewer-top">
             <span className="engine-tag"><span className="status-dot" /> {status}</span>
@@ -1063,8 +1348,49 @@ export function ImageTo3DStudio() {
               <h2>Pixels</h2>
               <span className="step-number">03</span>
             </div>
+            <div className="pixel-tool-grid" role="toolbar" aria-label="Ferramentas de edição de pixels">
+              {PIXEL_TOOLS.map(({ id, label, icon: Icon }) => (
+                <button
+                  type="button"
+                  key={id}
+                  className={activeTool === id ? "is-active" : ""}
+                  aria-label={label}
+                  title={label}
+                  aria-pressed={activeTool === id}
+                  onClick={() => togglePixelTool(id)}
+                >
+                  <Icon size={16} />
+                </button>
+              ))}
+            </div>
+            <div className="pixel-tool-settings">
+              <label className="active-color">
+                <span>Cor ativa</span>
+                <input
+                  type="color"
+                  value={selectionColor}
+                  onInput={(event) => changeActiveColor(event.currentTarget.value)}
+                  onChange={(event) => changeActiveColor(event.target.value)}
+                />
+              </label>
+              <label className="pixel-size-control">
+                <span>Tamanho do pixel <output>{Math.round(pixelSize * 100)}%</output></span>
+                <input
+                  type="range"
+                  min="0.35"
+                  max="1"
+                  step="0.01"
+                  value={pixelSize}
+                  onChange={(event) => setPixelSize(Number(event.target.value))}
+                />
+              </label>
+            </div>
             <p className="selection-instruction">
-              Clique em qualquer pixel. Use <strong>Shift + clique</strong> para adicionar ou remover pixels da seleção.
+              {activeTool ? (
+                <>Ferramenta ativa: <strong>{PIXEL_TOOLS.find((tool) => tool.id === activeTool)?.label}</strong>. Clique novamente para desativar.</>
+              ) : (
+                <><strong>Navegação 3D ativa.</strong> Arraste para girar o modelo.</>
+              )}
             </p>
             <div className="selection-toolbar" aria-label="Comandos de seleção de pixels">
               <button type="button" onClick={selectAllPixels}>Todos</button>
@@ -1086,14 +1412,9 @@ export function ImageTo3DStudio() {
             {selectedPixels.length > 0 ? (
               <>
                 <div className="color-editor">
-                  <label>
-                    <Palette size={14} /> Cor dos pixels
-                    <input
-                      type="color"
-                      value={selectionColor}
-                      onChange={(event) => recolorSelection(event.target.value)}
-                    />
-                  </label>
+                  <button type="button" onClick={() => recolorSelection(selectionColor)}>
+                    <Palette size={14} /> Aplicar cor
+                  </button>
                   <button type="button" onClick={restoreSelection}>
                     <Undo2 size={13} /> Original
                   </button>

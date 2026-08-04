@@ -36,7 +36,10 @@ test("server-renders the Image to 3D studio", async () => {
   assert.match(html, /Uma imagem entra/);
   assert.match(html, /Pixel nativo/);
   assert.match(html, /Pixels/);
-  assert.match(html, /Shift \+ clique/);
+  assert.match(html, /Ferramentas de edição de pixels/);
+  assert.match(html, /Lápis/);
+  assert.match(html, /Borracha/);
+  assert.match(html, /Tamanho do pixel/);
   assert.match(html, /Editar seleção/);
   assert.match(html, /Todos/);
   assert.match(html, /Inverter/);
