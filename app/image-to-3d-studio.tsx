@@ -75,6 +75,12 @@ type VoxelBuild = PixelSample & {
   rim: boolean;
 };
 
+type VoxelInterval = PixelSample & {
+  partId: PartId;
+  minZ: number;
+  maxZ: number;
+};
+
 type AnatomyGuides = {
   minX: number;
   maxX: number;
@@ -199,15 +205,23 @@ function classifyCharacterPart(x: number, y: number, guides: AnatomyGuides): Par
 
   if (y <= guides.headBottom) return "head";
   if (y >= guides.footStart) return left ? "left-foot" : "right-foot";
-  if (y >= guides.legStart && sideDistance < 0.27) {
-    return left ? "left-leg" : "right-leg";
-  }
-  if (sideDistance > 0.25) {
-    if (normalizedY > 0.67) return left ? "left-fingers" : "right-fingers";
-    if (normalizedY > 0.57) return left ? "left-hand" : "right-hand";
+  if (y >= guides.legStart) return left ? "left-leg" : "right-leg";
+
+  const torsoBoundary = normalizedY < 0.5 ? 0.19 : 0.21;
+  if (sideDistance > torsoBoundary) {
+    if (normalizedY > 0.64) return left ? "left-fingers" : "right-fingers";
+    if (normalizedY > 0.56) return left ? "left-hand" : "right-hand";
     return left ? "left-arm" : "right-arm";
   }
   return "torso";
+}
+
+function getPartDepthOffset(partId: PartId, bboxWidth: number) {
+  if (partId.includes("arm") || partId.includes("hand") || partId.includes("fingers")) {
+    return -Math.max(1, Math.round(bboxWidth * 0.025));
+  }
+  if (partId.includes("foot")) return Math.max(1, Math.round(bboxWidth * 0.02));
+  return 0;
 }
 
 function buildDistanceField(mask: Uint8Array, width: number, height: number) {
@@ -419,11 +433,7 @@ function sampleBackground(data: Uint8ClampedArray, width: number, height: number
 
 function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
   const maxDimension = Math.max(image.naturalWidth, image.naturalHeight);
-  const effectiveResolution = Math.min(
-    options.resolution,
-    maxDimension,
-    options.mode === "relief" ? 64 : 128,
-  );
+  const effectiveResolution = THREE.MathUtils.clamp(options.resolution, 32, 256);
   const width = Math.max(
     2,
     Math.round((image.naturalWidth / maxDimension) * effectiveResolution),
@@ -439,7 +449,8 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
   const context = canvas.getContext("2d", { willReadFrequently: true });
   if (!context) throw new Error("Canvas 2D is unavailable");
   context.clearRect(0, 0, width, height);
-  context.imageSmoothingEnabled = options.mode === "relief";
+  context.imageSmoothingEnabled = options.mode === "relief" || effectiveResolution > maxDimension;
+  context.imageSmoothingQuality = "high";
   context.drawImage(image, 0, 0, width, height);
 
   const pixels = context.getImageData(0, 0, width, height).data;
@@ -464,7 +475,7 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
       const blue = pixels[offset + 2];
       const alpha = pixels[offset + 3];
       const foreground = hasTransparency
-        ? alpha > 28
+        ? alpha > (effectiveResolution > maxDimension ? 72 : 28)
         : alpha > 28 && colorDistance(red, green, blue, background) > options.threshold;
 
       if (!foreground) continue;
@@ -483,13 +494,98 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
 
   const bboxWidth = Math.max(1, maxX - minX);
   const cell = 3.2 / Math.max(width, height);
-  const distanceField = buildDistanceField(foregroundMask, width, height);
   const anatomy = inferAnatomyGuides(foregroundMask, width, minX, maxX, minY, maxY);
   const samplesByPart = new Map<PartId, PixelSample[]>();
+  const partByPixel = new Int8Array(width * height);
+  partByPixel.fill(-1);
   for (const part of PARTS) samplesByPart.set(part.id, []);
 
   for (const sample of samples) {
-    samplesByPart.get(classifyCharacterPart(sample.x, sample.y, anatomy))?.push(sample);
+    const partId = classifyCharacterPart(sample.x, sample.y, anatomy);
+    samplesByPart.get(partId)?.push(sample);
+    partByPixel[sample.y * width + sample.x] = PARTS.findIndex((part) => part.id === partId);
+  }
+
+  const profilesByPart = new Map<PartId, AnatomyProfile>();
+  for (const part of PARTS) {
+    const partSamples = samplesByPart.get(part.id) ?? [];
+    if (partSamples.length > 0) profilesByPart.set(part.id, buildAnatomyProfile(partSamples, part.id));
+  }
+
+  const depthScale = THREE.MathUtils.mapLinear(options.depth, 0.12, 0.9, 0.6, 1.28);
+  const intervals: Array<VoxelInterval | null> = new Array(width * height).fill(null);
+  for (const sample of samples) {
+    const partIndex = partByPixel[sample.y * width + sample.x];
+    const partDefinition = PARTS[partIndex];
+    const profile = partDefinition ? profilesByPart.get(partDefinition.id) : undefined;
+    if (!partDefinition || !profile) continue;
+    const maxPartRadius = Math.max(3, Math.round(bboxWidth * 0.48));
+    const radius = THREE.MathUtils.clamp(
+      Math.ceil(getAnatomicalRadius(
+        sample,
+        profile,
+        partDefinition.id,
+        partDefinition.depth * depthScale,
+      )),
+      1,
+      maxPartRadius,
+    );
+    const frontDepth = THREE.MathUtils.clamp(
+      Math.ceil(getAnatomicalFrontDepth(
+        sample,
+        profile,
+        partDefinition.id,
+        partDefinition.depth * depthScale,
+      )),
+      1,
+      maxPartRadius,
+    );
+    const offset = getPartDepthOffset(partDefinition.id, bboxWidth);
+    intervals[sample.y * width + sample.x] = {
+      ...sample,
+      partId: partDefinition.id,
+      minZ: -radius + offset,
+      maxZ: frontDepth + offset,
+    };
+  }
+
+  const voxelsByPart = new Map<PartId, VoxelBuild[]>();
+  for (const part of PARTS) voxelsByPart.set(part.id, []);
+  const neighborOffsets = [[-1, 0], [1, 0], [0, -1], [0, 1]] as const;
+  for (const interval of intervals) {
+    if (!interval) continue;
+    const exposedLayers = new Set<number>([interval.minZ, interval.maxZ]);
+    for (const [offsetX, offsetY] of neighborOffsets) {
+      const neighborX = interval.x + offsetX;
+      const neighborY = interval.y + offsetY;
+      const neighbor = neighborX >= 0 && neighborX < width && neighborY >= 0 && neighborY < height
+        ? intervals[neighborY * width + neighborX]
+        : null;
+      if (!neighbor) {
+        for (let z = interval.minZ; z <= interval.maxZ; z += 1) exposedLayers.add(z);
+        continue;
+      }
+      for (let z = interval.minZ; z < Math.min(interval.maxZ + 1, neighbor.minZ); z += 1) {
+        exposedLayers.add(z);
+      }
+      for (let z = Math.max(interval.minZ, neighbor.maxZ + 1); z <= interval.maxZ; z += 1) {
+        exposedLayers.add(z);
+      }
+    }
+    const partVoxels = voxelsByPart.get(interval.partId);
+    for (const z of exposedLayers) {
+      partVoxels?.push({
+        x: interval.x,
+        y: interval.y,
+        red: interval.red,
+        green: interval.green,
+        blue: interval.blue,
+        z,
+        front: z === interval.maxZ,
+        back: z === interval.minZ,
+        rim: z !== interval.maxZ && z !== interval.minZ,
+      });
+    }
   }
 
   const model = new THREE.Group();
@@ -499,56 +595,14 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
 
   for (const partDefinition of PARTS) {
     const partSamples = samplesByPart.get(partDefinition.id) ?? [];
-    if (partSamples.length === 0) continue;
+    const voxels = voxelsByPart.get(partDefinition.id) ?? [];
+    if (partSamples.length === 0 || voxels.length === 0) continue;
 
-    const depthScale = THREE.MathUtils.mapLinear(options.depth, 0.12, 0.9, 0.6, 1.28);
     const baseColor = getRepresentativeColor(partSamples);
-    const anatomyProfile = buildAnatomyProfile(partSamples, partDefinition.id);
-    const voxels: VoxelBuild[] = [];
-
-    for (const sample of partSamples) {
-      const distance = distanceField[sample.y * width + sample.x];
-      const maxPartRadius = Math.max(3, Math.round(bboxWidth * 0.48));
-      const radius = THREE.MathUtils.clamp(
-        Math.ceil(getAnatomicalRadius(
-          sample,
-          anatomyProfile,
-          partDefinition.id,
-          partDefinition.depth * depthScale,
-        )),
-        1,
-        maxPartRadius,
-      );
-      const frontDepth = THREE.MathUtils.clamp(
-        Math.ceil(getAnatomicalFrontDepth(
-          sample,
-          anatomyProfile,
-          partDefinition.id,
-          partDefinition.depth * depthScale,
-        )),
-        1,
-        maxPartRadius,
-      );
-
-      const zLayers = new Set<number>([-radius, frontDepth]);
-      if (distance <= 2.5) {
-        for (let z = -radius; z <= frontDepth; z += 1) zLayers.add(z);
-      }
-
-      for (const z of zLayers) {
-        voxels.push({
-          ...sample,
-          z,
-          front: z === frontDepth,
-          back: z === -radius,
-          rim: distance <= 2.5,
-        });
-      }
-    }
 
     const geometry = options.mode === "pixel"
       ? new THREE.BoxGeometry(cell * 0.96, cell * 0.96, cell * 0.96)
-      : new RoundedBoxGeometry(cell * 0.92, cell * 0.92, cell * 0.92, 2, cell * 0.16);
+      : new RoundedBoxGeometry(cell * 0.96, cell * 0.96, cell * 0.96, 1, cell * 0.2);
     const material = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       roughness: options.mode === "pixel" ? 0.82 : 0.68,
@@ -564,7 +618,7 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
     mesh.userData.currentColors = [] as number[][];
     mesh.userData.frontInstanceIds = [] as number[];
     mesh.userData.pixelCoordinates = [] as Array<[number, number, number, number]>;
-    mesh.userData.renderPixelSize = options.mode === "pixel" ? 0.96 : 0.92;
+    mesh.userData.renderPixelSize = 0.96;
     mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
@@ -625,7 +679,7 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
 
   model.userData.generation = {
     mode: options.mode,
-    segmentation: "native-pixel-anatomical-capsules-v3",
+    segmentation: "adaptive-watertight-anatomical-volume-v4",
     sourceWidth: image.naturalWidth,
     sourceHeight: image.naturalHeight,
     sampleWidth: width,
@@ -665,8 +719,8 @@ export function ImageTo3DStudio() {
   const sourceImageRef = useRef<HTMLImageElement | null>(null);
   const spinRef = useRef(false);
 
-  const [mode, setMode] = useState<GenerationMode>("pixel");
-  const [resolution, setResolution] = useState(128);
+  const [mode, setMode] = useState<GenerationMode>("relief");
+  const [resolution, setResolution] = useState(256);
   const [depth, setDepth] = useState(0.42);
   const [threshold, setThreshold] = useState(52);
   const [activeView, setActiveView] = useState<ViewName>("front");
@@ -680,7 +734,7 @@ export function ImageTo3DStudio() {
   const [selectedPixels, setSelectedPixels] = useState<SelectedPixel[]>([]);
   const [selectionColor, setSelectionColor] = useState("#ffffff");
   const [activeTool, setActiveTool] = useState<PixelTool | null>("box-select");
-  const [pixelSize, setPixelSize] = useState(0.96);
+  const [pixelSize, setPixelSize] = useState(0.98);
   const activeToolRef = useRef<PixelTool | null>(activeTool);
   const selectionColorRef = useRef(selectionColor);
 
@@ -1089,7 +1143,7 @@ export function ImageTo3DStudio() {
         setSelectionColor("#ffffff");
         setActiveView("front");
         setStatus(
-          `${result.metrics.sourcePixels.toLocaleString("pt-BR")} pixels preservados · ${result.metrics.elements.toLocaleString("pt-BR")} voxels 3D`,
+          `${result.metrics.sourcePixels.toLocaleString("pt-BR")} amostras frontais · ${result.metrics.elements.toLocaleString("pt-BR")} voxels 3D`,
         );
       } catch (error) {
         setMetrics(EMPTY_METRICS);
@@ -1354,7 +1408,7 @@ export function ImageTo3DStudio() {
           <span>IMAGE<span>→</span>3D</span>
         </div>
         <div className="build-tag">
-          <span className="status-dot" /> local anatomy engine · alpha 0.5
+          <span className="status-dot" /> watertight anatomy engine · alpha 0.6
         </div>
       </header>
 
@@ -1412,7 +1466,7 @@ export function ImageTo3DStudio() {
             >
               <Grid3X3 size={18} />
               <strong>Pixel nativo</strong>
-              <span>1 pixel = 1 cubo frontal</span>
+              <span>cubos individuais editáveis</span>
             </button>
             <button
               className={`mode-button ${mode === "relief" ? "is-active" : ""}`}
@@ -1428,12 +1482,14 @@ export function ImageTo3DStudio() {
           <div className="divider" />
           <div className="sliders">
             <label className="slider-row">
-              <span className="slider-label">Grade de pixels <output>{resolution}</output></span>
+              <span className="slider-label">Resolução geométrica <output>{resolution}</output></span>
               <input
                 type="range"
-                min="32"
-                max="128"
+                min="64"
+                max="256"
+                step="16"
                 value={resolution}
+                onInput={(event) => setResolution(Number(event.currentTarget.value))}
                 onChange={(event) => setResolution(Number(event.target.value))}
               />
             </label>
@@ -1445,6 +1501,7 @@ export function ImageTo3DStudio() {
                 max="0.9"
                 step="0.02"
                 value={depth}
+                onInput={(event) => setDepth(Number(event.currentTarget.value))}
                 onChange={(event) => setDepth(Number(event.target.value))}
               />
             </label>
@@ -1455,6 +1512,7 @@ export function ImageTo3DStudio() {
                 min="18"
                 max="130"
                 value={threshold}
+                onInput={(event) => setThreshold(Number(event.currentTarget.value))}
                 onChange={(event) => setThreshold(Number(event.target.value))}
               />
             </label>
@@ -1532,6 +1590,7 @@ export function ImageTo3DStudio() {
                   max="1"
                   step="0.01"
                   value={pixelSize}
+                  onInput={(event) => setPixelSize(Number(event.currentTarget.value))}
                   onChange={(event) => setPixelSize(Number(event.target.value))}
                 />
               </label>
@@ -1600,7 +1659,7 @@ export function ImageTo3DStudio() {
           </div>
 
           <div className="compact-metrics">
-            <span>{(metrics.sourcePixels ?? 0).toLocaleString("pt-BR")} pixels frontais</span>
+            <span>{(metrics.sourcePixels ?? 0).toLocaleString("pt-BR")} amostras frontais</span>
             <span>{metrics.elements.toLocaleString("pt-BR")} voxels</span>
             <span>{metrics.triangles.toLocaleString("pt-BR")} tris</span>
           </div>
@@ -1639,7 +1698,7 @@ export function ImageTo3DStudio() {
         <article className="workflow-step">
           <span>03 / BUILD</span>
           <h3>Frente pixel a pixel</h3>
-          <p>A grade nativa preserva cada pixel frontal e infla cabeça, tronco e membros como volumes anatômicos.</p>
+          <p>A referência permanece intacta; uma grade adaptativa constrói volumes contínuos e trata linhas escuras como decalques.</p>
         </article>
         <article className="workflow-step">
           <span>04 / EDIT + SHIP</span>

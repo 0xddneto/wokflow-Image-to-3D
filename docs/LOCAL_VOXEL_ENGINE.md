@@ -32,7 +32,7 @@ roda no navegador sem servidor, token ou GPU dedicada.
 ## Resultado verificado com a base MOB
 
 - Entrada: 128 x 128 RGBA.
-- Grade padrão: 128, preservando pixel a pixel a base nativa de 128×128.
+- A referência permanece nativa em 128×128, enquanto a geometria usa supersampling adaptativo de 64 a 256 sem modificar o arquivo original.
 - Frente: 4.787 pixels opacos preservados como 4.787 cubos frontais separados.
 - Saída volumétrica: 52.961 voxels individuais em 12 partes.
 - GLB exportado: 9.209.288 bytes.
@@ -46,7 +46,9 @@ roda no navegador sem servidor, token ou GPU dedicada.
 - Cor, movimento X/Y/Z, restauração e exclusão são aplicados a um, vários ou todos os pixels selecionados.
 - A barra inclui lápis, borracha, preenchimento, conta-gotas, seleção retangular, varinha, laço, linha, retângulo e círculo.
 - O tamanho físico dos pixels pode ser alterado depois da geração, sem reconstruir o modelo nem descartar edições.
-- O motor anatômico v3 usa seções elípticas suavizadas por região para formar crânio, tronco, braços, mãos, pernas e pés sem achatar a vista lateral.
+- O motor anatômico v4 usa seções elípticas suavizadas e extrai uma superfície contínua sem os buracos da antiga casca simplificada.
+- Pixels pretos e outras linhas internas só colorem a face frontal; laterais e fundo usam a cor material da região.
+- Braços, mãos e pés recebem classificação e deslocamento de profundidade próprios para não se fundirem ao tronco.
 - O modo pixel usa material físico com luz principal, preenchimento e recorte para revelar volume sem perder a cor original da frente.
 - Build e testes do site aprovados.
 

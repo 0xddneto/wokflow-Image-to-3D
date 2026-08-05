@@ -40,8 +40,9 @@ test("server-renders the Image to 3D studio", async () => {
   assert.match(html, /Lápis/);
   assert.match(html, /Borracha/);
   assert.match(html, /Tamanho do pixel/);
-  assert.match(html, /local anatomy engine/);
-  assert.match(html, /volumes anatômicos/);
+  assert.match(html, /watertight anatomy engine/);
+  assert.match(html, /grade adaptativa/);
+  assert.match(html, /linhas escuras como decalques/);
   assert.match(html, /Editar seleção/);
   assert.match(html, /Todos/);
   assert.match(html, /Inverter/);
