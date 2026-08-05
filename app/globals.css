@@ -614,6 +614,68 @@ input[type="range"]::-webkit-slider-thumb {
   color: var(--acid);
 }
 
+.sprite-engine-choice {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0 10px;
+}
+
+.sprite-engine-choice button {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+  padding: 8px 10px;
+  border: 1px solid #2b3540;
+  background: #121820;
+  color: #87939f;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sprite-engine-choice button.is-active {
+  border-color: var(--acid);
+  background: rgba(168, 255, 207, 0.07);
+  color: var(--acid);
+}
+
+.sprite-engine-choice strong,
+.sprite-engine-choice small {
+  display: block;
+}
+
+.sprite-engine-choice strong {
+  color: var(--paper);
+  font-size: 10px;
+}
+
+.sprite-engine-choice small {
+  margin-top: 2px;
+  color: #77838f;
+  font-size: 8px;
+}
+
+.sprite-description {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+  color: #7d8995;
+  font-size: 8px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.sprite-description textarea {
+  min-height: 64px;
+  resize: vertical;
+  padding: 8px;
+  border: 1px solid #2b3540;
+  background: #0e141a;
+  color: #cbd1d6;
+  font: 9px/1.45 var(--font-geist-mono), monospace;
+}
+
 .viewer.is-editing canvas {
   cursor: crosshair !important;
 }

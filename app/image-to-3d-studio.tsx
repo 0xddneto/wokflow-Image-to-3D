@@ -35,12 +35,14 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
+import { generateNativeSpriteSet, type NativeSpriteDirection } from "./native-sprite-engine";
 
 type GenerationMode = "pixel" | "relief";
 type OutputMode = "pixel-character" | "pixel-3d";
 type DirectionCount = 1 | 2 | 4 | 8;
-type DirectionId = "south" | "south-east" | "east" | "north-east" | "north" | "north-west" | "west" | "south-west";
+type DirectionId = NativeSpriteDirection;
 type DirectionImageMap = Partial<Record<DirectionId, string>>;
+type SpriteEngine = "ai-multiview" | "local-experimental";
 type ViewName = "front" | "quarter" | "side";
 type PixelTool = "pencil" | "eraser" | "fill" | "eyedropper" | "box-select" | "wand" | "lasso" | "line" | "rectangle" | "circle";
 
@@ -204,16 +206,28 @@ const DIRECTION_SETS: Record<DirectionCount, DirectionId[]> = {
   8: DIRECTIONS.map((direction) => direction.id),
 };
 
-const DIRECTION_ROTATIONS: Record<DirectionId, number> = {
-  south: 0,
-  "south-east": -Math.PI / 4,
-  east: -Math.PI / 2,
-  "north-east": -Math.PI * 3 / 4,
-  north: Math.PI,
-  "north-west": Math.PI * 3 / 4,
-  west: Math.PI / 2,
-  "south-west": Math.PI / 4,
-};
+const SPRITE_FRAME_SIZE = 256;
+
+function wait(milliseconds: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+function prepareReferenceImage(image: HTMLImageElement) {
+  const scale = Math.min(1, 256 / Math.max(image.naturalWidth, image.naturalHeight));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Canvas de referência indisponível");
+  context.imageSmoothingEnabled = false;
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/png");
+}
+
+async function readApiError(response: Response) {
+  const body = await response.json().catch(() => null) as { error?: unknown } | null;
+  return typeof body?.error === "string" ? body.error : `Falha no motor de IA (${response.status})`;
+}
 
 function loadBrowserImage(source: string) {
   return new Promise<HTMLImageElement>((resolve, reject) => {
@@ -986,14 +1000,15 @@ export function ImageTo3DStudio() {
   const cameraRef = useRef<THREE.OrthographicCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
-  const sceneRef = useRef<THREE.Scene | null>(null);
   const sourceImageRef = useRef<HTMLImageElement | null>(null);
   const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
   const spinRef = useRef(false);
-  const outputModeRef = useRef<OutputMode>("pixel-3d");
+  const outputModeRef = useRef<OutputMode>("pixel-character");
 
-  const [outputMode, setOutputMode] = useState<OutputMode>("pixel-3d");
+  const [outputMode, setOutputMode] = useState<OutputMode>("pixel-character");
   const [directionCount, setDirectionCount] = useState<DirectionCount>(8);
+  const [spriteEngine, setSpriteEngine] = useState<SpriteEngine>("ai-multiview");
+  const [spriteDescription, setSpriteDescription] = useState("humanoid pixel art character; preserve the exact body proportions, silhouette, palette and anatomy of the reference");
   const [mode, setMode] = useState<GenerationMode>("relief");
   const [resolution, setResolution] = useState(256);
   const [depth, setDepth] = useState(0.42);
@@ -1011,7 +1026,7 @@ export function ImageTo3DStudio() {
   const [directionImages, setDirectionImages] = useState<DirectionImageMap>({});
   const [selectedPixels, setSelectedPixels] = useState<SelectedPixel[]>([]);
   const [selectionColor, setSelectionColor] = useState("#ffffff");
-  const [activeTool, setActiveTool] = useState<PixelTool | null>("box-select");
+  const [activeTool, setActiveTool] = useState<PixelTool | null>(null);
   const [pixelSize, setPixelSize] = useState(0.98);
   const [poseReady, setPoseReady] = useState(false);
   const [poseLandmarks, setPoseLandmarks] = useState<NormalizedLandmark[] | null>(null);
@@ -1033,6 +1048,7 @@ export function ImageTo3DStudio() {
     setOutputMode(nextMode);
     spinRef.current = false;
     setAutoRotate(false);
+    setPoseReady(false);
     setActiveTool(nextMode === "pixel-3d" ? "box-select" : null);
     setSelectedPixels([]);
     setStatus(
@@ -1043,103 +1059,63 @@ export function ImageTo3DStudio() {
   }, []);
 
   const requestDirectionalGeneration = useCallback(async () => {
-    const renderer = rendererRef.current;
-    const scene = sceneRef.current;
-    const camera = cameraRef.current;
-    const root = rootRef.current;
-    const controls = controlsRef.current;
-    const viewer = viewerRef.current;
-    if (!renderer || !scene || !camera || !root?.children[0] || !controls || !viewer) {
-      setStatus("O modelo local ainda está sendo preparado");
+    const image = sourceImageRef.current;
+    if (!image) {
+      setStatus("A imagem de referência ainda está sendo preparada");
       return;
     }
 
     setGeneratingDirections(true);
-    setStatus(`Renderizando ${directionCount} ${directionCount === 1 ? "direção" : "direções"}…`);
-    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
-
-    const previousCamera = {
-      position: camera.position.clone(),
-      quaternion: camera.quaternion.clone(),
-      zoom: camera.zoom,
-      left: camera.left,
-      right: camera.right,
-      top: camera.top,
-      bottom: camera.bottom,
-    };
-    const previousRootRotation = root.rotation.clone();
-    const previousTarget = controls.target.clone();
-    const previousControlsEnabled = controls.enabled;
-    const previousPixelRatio = renderer.getPixelRatio();
-    const previousFog = scene.fog;
-    const previousClearColor = renderer.getClearColor(new THREE.Color()).clone();
-    const previousClearAlpha = renderer.getClearAlpha();
-    const floor = scene.getObjectByName("preview-floor");
-    const previousFloorVisibility = floor?.visible ?? false;
-
+    setDirectionImages({});
     try {
-      controls.enabled = false;
-      spinRef.current = false;
-      setAutoRotate(false);
-      if (floor) floor.visible = false;
-      scene.fog = null;
-      renderer.setClearColor(0x000000, 0);
-      renderer.setPixelRatio(1);
-      renderer.setSize(256, 256, false);
-      camera.position.set(0, 0.05, 6.5);
-      camera.quaternion.identity();
-      camera.up.set(0, 1, 0);
-      camera.lookAt(0, 0, 0.2);
-      camera.zoom = 1;
-      camera.left = -2.3;
-      camera.right = 2.3;
-      camera.top = 2.3;
-      camera.bottom = -2.3;
-      camera.updateProjectionMatrix();
-
-      const captured: DirectionImageMap = {};
-      for (const direction of selectedDirections) {
-        root.rotation.set(0, DIRECTION_ROTATIONS[direction.id], 0);
-        root.updateMatrixWorld(true);
-        camera.updateMatrixWorld(true);
-        renderer.render(scene, camera);
-
-        const output = document.createElement("canvas");
-        output.width = 128;
-        output.height = 128;
-        const context = output.getContext("2d");
-        if (!context) throw new Error("Canvas de exportação indisponível");
-        context.clearRect(0, 0, 128, 128);
-        context.imageSmoothingEnabled = false;
-        context.drawImage(renderer.domElement, 0, 0, 128, 128);
-        captured[direction.id] = output.toDataURL("image/png");
+      if (spriteEngine === "local-experimental") {
+        setStatus(`Desenhando ${directionCount} ${directionCount === 1 ? "sprite" : "sprites"} no motor experimental…`);
+        await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+        const generated = generateNativeSpriteSet(image, selectedDirections.map((direction) => direction.id), SPRITE_FRAME_SIZE);
+        setDirectionImages(generated);
+        setStatus(`${selectedDirections.length} sprites experimentais · este modo não reproduz a qualidade multivista da IA`);
+        return;
       }
-      setDirectionImages(captured);
-      setStatus(`${selectedDirections.length} ${selectedDirections.length === 1 ? "direção gerada" : "direções geradas"} · fundo transparente · 128×128`);
+
+      setStatus("Enviando a referência ao motor multivista…");
+      const submit = await fetch("/api/pixel-character/jobs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          referenceImage: prepareReferenceImage(image),
+          description: spriteDescription,
+        }),
+      });
+      if (!submit.ok) throw new Error(await readApiError(submit));
+      const submitted = await submit.json() as { jobId?: string };
+      if (!submitted.jobId) throw new Error("O motor não devolveu um identificador de geração");
+
+      for (let attempt = 1; attempt <= 60; attempt += 1) {
+        setStatus(`IA reconstruindo anatomia e rotação · ${Math.min(attempt * 4, 240)}s`);
+        if (attempt > 1) await wait(4000);
+        const poll = await fetch(`/api/pixel-character/jobs/${encodeURIComponent(submitted.jobId)}`, {
+          cache: "no-store",
+        });
+        if (!poll.ok) throw new Error(await readApiError(poll));
+        const result = await poll.json() as {
+          status?: string;
+          error?: string;
+          images?: DirectionImageMap;
+        };
+        if (result.status === "failed") throw new Error(result.error ?? "A geração multivista falhou");
+        if (result.status !== "completed") continue;
+        if (!result.images) throw new Error("A geração terminou sem imagens");
+        setDirectionImages(result.images);
+        setStatus(`8 direções geradas por IA · exibindo ${selectedDirections.length} · 2D contínuo`);
+        return;
+      }
+      throw new Error("A geração excedeu quatro minutos. Tente consultar novamente.");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Falha ao gerar as direções");
     } finally {
-      root.rotation.copy(previousRootRotation);
-      camera.position.copy(previousCamera.position);
-      camera.quaternion.copy(previousCamera.quaternion);
-      camera.zoom = previousCamera.zoom;
-      camera.left = previousCamera.left;
-      camera.right = previousCamera.right;
-      camera.top = previousCamera.top;
-      camera.bottom = previousCamera.bottom;
-      camera.updateProjectionMatrix();
-      controls.target.copy(previousTarget);
-      controls.enabled = previousControlsEnabled;
-      controls.update();
-      scene.fog = previousFog;
-      if (floor) floor.visible = previousFloorVisibility;
-      renderer.setClearColor(previousClearColor, previousClearAlpha);
-      renderer.setPixelRatio(previousPixelRatio);
-      const { width, height } = viewer.getBoundingClientRect();
-      renderer.setSize(Math.max(1, width), Math.max(1, height), false);
       setGeneratingDirections(false);
     }
-  }, [directionCount, selectedDirections]);
+  }, [directionCount, selectedDirections, spriteDescription, spriteEngine]);
 
   const downloadDirectionSheet = useCallback(async () => {
     const images = selectedDirections.map((direction) => directionImages[direction.id]);
@@ -1151,13 +1127,19 @@ export function ImageTo3DStudio() {
       const columns = Math.min(selectedDirections.length, 4);
       const rows = Math.ceil(selectedDirections.length / columns);
       const sheet = document.createElement("canvas");
-      sheet.width = columns * 128;
-      sheet.height = rows * 128;
+      sheet.width = columns * SPRITE_FRAME_SIZE;
+      sheet.height = rows * SPRITE_FRAME_SIZE;
       const context = sheet.getContext("2d");
       if (!context) throw new Error("Canvas de exportação indisponível");
       context.imageSmoothingEnabled = false;
       loaded.forEach((image, index) => {
-        context.drawImage(image, (index % columns) * 128, Math.floor(index / columns) * 128, 128, 128);
+        context.drawImage(
+          image,
+          (index % columns) * SPRITE_FRAME_SIZE,
+          Math.floor(index / columns) * SPRITE_FRAME_SIZE,
+          SPRITE_FRAME_SIZE,
+          SPRITE_FRAME_SIZE,
+        );
       });
       const link = document.createElement("a");
       link.href = sheet.toDataURL("image/png");
@@ -1174,6 +1156,7 @@ export function ImageTo3DStudio() {
   }, [directionCount, directionImages, fileName, selectedDirections]);
 
   useEffect(() => {
+    if (outputMode !== "pixel-3d") return;
     let cancelled = false;
     let detector: PoseLandmarker | null = null;
     const initializePose = async () => {
@@ -1216,14 +1199,15 @@ export function ImageTo3DStudio() {
       poseLandmarkerRef.current = null;
       detector?.close();
     };
-  }, []);
+  }, [outputMode]);
 
   useEffect(() => {
+    if (outputMode !== "pixel-3d") return;
     const canvas = canvasRef.current;
     const viewer = viewerRef.current;
     if (!canvas || !viewer) return;
 
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, preserveDrawingBuffer: true });
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -1234,7 +1218,6 @@ export function ImageTo3DStudio() {
 
     const scene = new THREE.Scene();
     scene.fog = new THREE.Fog(0x0c1116, 8, 13);
-    sceneRef.current = scene;
 
     const camera = new THREE.OrthographicCamera(-2.3, 2.3, 2.3, -2.3, 0.01, 40);
     camera.position.set(0, 0.05, 6.5);
@@ -1576,9 +1559,8 @@ export function ImageTo3DStudio() {
       cameraRef.current = null;
       controlsRef.current = null;
       rendererRef.current = null;
-      sceneRef.current = null;
     };
-  }, []);
+  }, [outputMode]);
 
   const loadImage = useCallback((url: string, name: string) => {
     setStatus("Lendo pixels e transparência…");
@@ -1605,7 +1587,7 @@ export function ImageTo3DStudio() {
   }, [loadImage]);
 
   useEffect(() => {
-    if (!poseReady) return;
+    if (outputMode !== "pixel-3d" || !poseReady) return;
     const image = sourceImageRef.current;
     const detector = poseLandmarkerRef.current;
     if (!image || !detector) {
@@ -1645,9 +1627,10 @@ export function ImageTo3DStudio() {
       setPersonMask(null);
       setPoseEngineStatus("prior estilizado ativo");
     }
-  }, [poseReady, preview]);
+  }, [outputMode, poseReady, preview]);
 
   useEffect(() => {
+    if (outputMode !== "pixel-3d") return;
     const timer = window.setTimeout(() => {
       const image = sourceImageRef.current;
       const root = rootRef.current;
@@ -2036,11 +2019,44 @@ export function ImageTo3DStudio() {
                   </button>
                 ))}
               </div>
-              <button className="generate-direction-button" type="button" disabled={generatingDirections || metrics.elements === 0} onClick={requestDirectionalGeneration}>
-                <Sparkles size={15} /> {generatingDirections ? "Renderizando…" : `Gerar ${directionCount} ${directionCount === 1 ? "direção" : "direções"}`}
+              <div className="sprite-engine-choice" role="radiogroup" aria-label="Motor de geração de sprites">
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={spriteEngine === "ai-multiview"}
+                  className={spriteEngine === "ai-multiview" ? "is-active" : ""}
+                  onClick={() => setSpriteEngine("ai-multiview")}
+                >
+                  <Sparkles size={14} /><span><strong>IA multivista</strong><small>qualidade PixelLab · 8 vistas coerentes</small></span>
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={spriteEngine === "local-experimental"}
+                  className={spriteEngine === "local-experimental" ? "is-active" : ""}
+                  onClick={() => setSpriteEngine("local-experimental")}
+                >
+                  <Grid3X3 size={14} /><span><strong>Local experimental</strong><small>rápido · template simples</small></span>
+                </button>
+              </div>
+              {spriteEngine === "ai-multiview" && (
+                <label className="sprite-description">
+                  <span>Descrição auxiliar</span>
+                  <textarea
+                    value={spriteDescription}
+                    maxLength={2000}
+                    rows={3}
+                    onChange={(event) => setSpriteDescription(event.target.value)}
+                  />
+                </label>
+              )}
+              <button className="generate-direction-button" type="button" disabled={generatingDirections} onClick={requestDirectionalGeneration}>
+                <Sparkles size={15} /> {generatingDirections ? "Gerando…" : `Gerar ${directionCount} ${directionCount === 1 ? "direção" : "direções"}`}
               </button>
               <p className="engine-contract-note">
-                O motor local gira a geometria reconstruída e renderiza cada direção separadamente em PNG 128×128 com fundo transparente.
+                {spriteEngine === "ai-multiview"
+                  ? "A IA gera oito sprites 2D contínuos a partir da vista frontal; a interface mostra a quantidade escolhida. Requer PIXELLAB_SECRET no servidor."
+                  : "Este template local serve apenas para testes de interface e não substitui um modelo generativo multivista."}
               </p>
             </>
           ) : (
@@ -2128,9 +2144,9 @@ export function ImageTo3DStudio() {
                     // eslint-disable-next-line @next/next/no-img-element
                     <img src={directionImages[direction.id]} alt={`Personagem em ${direction.label.toLowerCase()}`} />
                   ) : (
-                    <div className="direction-placeholder"><Sparkles size={18} /><span>clique em gerar</span></div>
+                    <div className="direction-placeholder"><Sparkles size={18} /><span>{spriteEngine === "ai-multiview" ? "IA multivista" : "local experimental"}</span></div>
                   )}
-                  <small>{directionImages[direction.id] ? "render local pronto" : "aguardando render"}</small>
+                  <small>{directionImages[direction.id] ? "sprite 2D pronto" : "clique em gerar"}</small>
                 </article>
               ))}
             </div>
@@ -2195,7 +2211,7 @@ export function ImageTo3DStudio() {
                 <Download size={16} /> {exporting ? "Montando PNG…" : "Exportar spritesheet PNG"}
               </button>
               <p className="privacy-note">
-                <ShieldCheck size={14} /> Geração e exportação executadas localmente neste dispositivo.
+                <ShieldCheck size={14} /> A referência vai ao provedor somente no modo IA; a chave permanece protegida no servidor.
               </p>
             </div>
           ) : (<>
@@ -2341,12 +2357,12 @@ export function ImageTo3DStudio() {
         <article className="workflow-step">
           <span>02 / MULTIVIEW</span>
           <h3>Identidade em direções</h3>
-          <p>O Pixel Character entrega 1, 2, 4 ou 8 sprites. O Pixel 3D solicita oito vistas internamente.</p>
+          <p>O Pixel Character usa IA multivista para gerar oito sprites 2D coerentes. O Pixel 3D usa um pipeline separado.</p>
         </article>
         <article className="workflow-step">
           <span>03 / RECONSTRUCT</span>
           <h3>Corpo dividido</h3>
-          <p>Pose, máscara e concordância entre vistas posicionam volumes, membros e profundidade sem transformar contornos em buracos.</p>
+          <p>No 2D, o modelo reconstrói anatomia, silhueta e sobreposição por direção. No 3D, pose e máscara posicionam volumes e profundidade.</p>
         </article>
         <article className="workflow-step">
           <span>04 / EDIT + SHIP</span>
