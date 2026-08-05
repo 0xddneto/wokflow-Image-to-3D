@@ -370,6 +370,11 @@ label:focus-within {
   cursor: pointer;
 }
 
+.generate-direction-button:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
 .engine-contract-note {
   margin: 10px 0 0;
   color: #75818d;
@@ -1304,7 +1309,8 @@ input[type="range"]::-webkit-slider-thumb {
   }
 
   .direction-preview-grid {
-    grid-template-columns: repeat(2, minmax(110px, 1fr));
+    grid-template-columns: repeat(4, minmax(90px, 1fr));
+    align-content: start;
     overflow-y: auto;
   }
 }

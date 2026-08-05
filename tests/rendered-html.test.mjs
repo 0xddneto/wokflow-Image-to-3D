@@ -71,7 +71,12 @@ test("ships the canonical MOB example without coupling the tool to MOBs", async 
   assert.match(studio, /type OutputMode = "pixel-character" \| "pixel-3d"/);
   assert.match(studio, /const DIRECTION_SETS/);
   assert.match(studio, /DIRECTION_SETS\[directionCount\]/);
-  assert.match(studio, /aguardando conexão do motor de IA/);
+  assert.match(studio, /const DIRECTION_ROTATIONS/);
+  assert.match(studio, /requestDirectionalGeneration/);
+  assert.match(studio, /renderer\.domElement/);
+  assert.match(studio, /downloadDirectionSheet/);
+  assert.match(studio, /Exportar spritesheet PNG/);
+  assert.doesNotMatch(studio, /aguardando conexão do motor de IA/);
   assert.match(studio, /GLTFExporter/);
   assert.match(studio, /ImageTo3D_EditableCharacter/);
   assert.match(studio, /classifyCharacterPart/);
