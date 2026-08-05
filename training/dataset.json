@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "directions": [
+    "south",
+    "south-east",
+    "east",
+    "north-east",
+    "north",
+    "north-west",
+    "west",
+    "south-west"
+  ],
+  "samples": [
+    {
+      "id": "mob-base-v1",
+      "author": "0xddneto",
+      "rights": "user-authored",
+      "approval": "approved",
+      "uses": ["training-seed", "golden-validation"],
+      "input": "public/examples/mobs-base.png",
+      "targets": {
+        "south": "public/models/mobs-canonical-directions/south.png",
+        "south-east": "public/models/mobs-canonical-directions/south-east.png",
+        "east": "public/models/mobs-canonical-directions/east.png",
+        "north-east": "public/models/mobs-canonical-directions/north-east.png",
+        "north": "public/models/mobs-canonical-directions/north.png",
+        "north-west": "public/models/mobs-canonical-directions/north-west.png",
+        "west": "public/models/mobs-canonical-directions/west.png",
+        "south-west": "public/models/mobs-canonical-directions/south-west.png"
+      }
+    }
+  ]
+}

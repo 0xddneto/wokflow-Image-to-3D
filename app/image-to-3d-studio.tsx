@@ -40,6 +40,13 @@ import {
   generateNativeSpriteSet,
   type NativeSpriteDirection,
 } from "./native-sprite-engine";
+import {
+  createSoftwareControls,
+  createSoftwareVoxelRenderer,
+  tryCreateWebGlRenderer,
+  type PreviewControls,
+  type PreviewRenderer,
+} from "./software-voxel-renderer";
 
 type GenerationMode = "pixel" | "relief";
 type OutputMode = "pixel-character" | "pixel-3d";
@@ -981,14 +988,16 @@ export function ImageTo3DStudio() {
   const viewerRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<THREE.Group | null>(null);
   const cameraRef = useRef<THREE.OrthographicCamera | null>(null);
-  const controlsRef = useRef<OrbitControls | null>(null);
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const controlsRef = useRef<PreviewControls | null>(null);
+  const rendererRef = useRef<PreviewRenderer | null>(null);
   const sourceImageRef = useRef<HTMLImageElement | null>(null);
   const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
   const spinRef = useRef(false);
   const outputModeRef = useRef<OutputMode>("pixel-character");
 
   const [outputMode, setOutputMode] = useState<OutputMode>("pixel-character");
+  const [threeSessionActive, setThreeSessionActive] = useState(false);
+  const [renderBackend, setRenderBackend] = useState("3D aguardando");
   const [directionCount, setDirectionCount] = useState<DirectionCount>(8);
   const [spriteEngine, setSpriteEngine] = useState<SpriteEngine>("canonical-local");
   const [mode, setMode] = useState<GenerationMode>("relief");
@@ -1028,6 +1037,7 @@ export function ImageTo3DStudio() {
   const changeOutputMode = useCallback((nextMode: OutputMode) => {
     outputModeRef.current = nextMode;
     setOutputMode(nextMode);
+    if (nextMode === "pixel-3d") setThreeSessionActive(true);
     spinRef.current = false;
     setAutoRotate(false);
     setPoseReady(false);
@@ -1158,18 +1168,14 @@ export function ImageTo3DStudio() {
   }, [outputMode]);
 
   useEffect(() => {
-    if (outputMode !== "pixel-3d") return;
+    if (!threeSessionActive) return;
     const canvas = canvasRef.current;
     const viewer = viewerRef.current;
     if (!canvas || !viewer) return;
 
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.35;
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    const webglResult = tryCreateWebGlRenderer(canvas);
+    const renderer = webglResult?.renderer ?? createSoftwareVoxelRenderer(canvas);
+    setRenderBackend(webglResult ? "WebGL 3D" : "Canvas 2D · fallback 3D");
     rendererRef.current = renderer;
 
     const scene = new THREE.Scene();
@@ -1179,19 +1185,23 @@ export function ImageTo3DStudio() {
     camera.position.set(0, 0.05, 6.5);
     cameraRef.current = camera;
 
-    const controls = new OrbitControls(camera, canvas);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.07;
-    controls.enablePan = false;
-    controls.minDistance = 2.6;
-    controls.maxDistance = 10;
-    controls.target.set(0, 0, 0.2);
-    controlsRef.current = controls;
-
     const root = new THREE.Group();
     root.name = "GeneratedAssetRoot";
     scene.add(root);
     rootRef.current = root;
+
+    const controls: PreviewControls = webglResult
+      ? new OrbitControls(camera, canvas)
+      : createSoftwareControls(canvas, camera, root, () => activeToolRef.current !== null);
+    if (controls instanceof OrbitControls) {
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.07;
+      controls.enablePan = false;
+      controls.minDistance = 2.6;
+      controls.maxDistance = 10;
+      controls.target.set(0, 0, 0.2);
+    }
+    controlsRef.current = controls;
 
     const key = new THREE.DirectionalLight(0xffe5d2, 1.65);
     key.position.set(-3.5, 5, 5);
@@ -1497,7 +1507,7 @@ export function ImageTo3DStudio() {
       const delta = Math.min(clock.getDelta(), 0.05);
       if (spinRef.current) root.rotation.y += delta * 0.45;
       controls.update();
-      renderer.render(scene, camera);
+      if (outputModeRef.current === "pixel-3d") renderer.render(scene, camera);
     });
 
     return () => {
@@ -1516,7 +1526,7 @@ export function ImageTo3DStudio() {
       controlsRef.current = null;
       rendererRef.current = null;
     };
-  }, [outputMode]);
+  }, [threeSessionActive]);
 
   const loadImage = useCallback((url: string, name: string) => {
     setStatus("Lendo pixels e transparência…");
@@ -1882,6 +1892,7 @@ export function ImageTo3DStudio() {
         </div>
         <div className="build-tag">
           <span className="status-dot" /> dual output · semantic anatomy v5 · {poseEngineStatus}
+          {outputMode === "pixel-3d" ? ` · ${renderBackend}` : ""}
         </div>
       </header>
 
@@ -1891,8 +1902,8 @@ export function ImageTo3DStudio() {
           <h1>Uma imagem entra. <em>Sprites ou Pixel 3D saem.</em></h1>
         </div>
         <p className="intro-copy">
-          Gere um personagem em até oito direções ou use oito vistas internamente
-          para reconstruir um Pixel 3D com voxels editáveis.
+          Gere um personagem em até oito direções ou reconstrua uma aproximação
+          Pixel 3D frontal com voxels editáveis.
         </p>
       </section>
 
@@ -1950,7 +1961,7 @@ export function ImageTo3DStudio() {
               onClick={() => changeOutputMode("pixel-3d")}
             >
               <Box size={18} />
-              <span><strong>Pixel 3D</strong><small>multivista interna · voxels editáveis</small></span>
+              <span><strong>Pixel 3D</strong><small>reconstrução frontal · voxels editáveis</small></span>
             </button>
           </div>
 
@@ -1983,7 +1994,7 @@ export function ImageTo3DStudio() {
                   className={spriteEngine === "canonical-local" ? "is-active" : ""}
                   onClick={() => setSpriteEngine("canonical-local")}
                 >
-                  <Sparkles size={14} /><span><strong>Motor local MOB</strong><small>8 vistas suas aprovadas · sem API</small></span>
+                  <Sparkles size={14} /><span><strong>Rig local MOB</strong><small>8 vistas fixas aprovadas · ainda sem treino</small></span>
                 </button>
                 <button
                   type="button"
@@ -2000,7 +2011,7 @@ export function ImageTo3DStudio() {
               </button>
               <p className="engine-contract-note">
                 {spriteEngine === "canonical-local"
-                  ? "As oito vistas 2D aprovadas são o rig canônico. A referência fornece a paleta; anatomia, contorno e pixels permanecem consistentes sem API externa."
+                  ? "As oito vistas 2D aprovadas são o rig canônico fixo. Ele preserva sua qualidade, mas ainda não generaliza anatomias novas; isso exige o modelo treinável e um conjunto multivista."
                   : "Este template local serve apenas para testes de interface e não substitui um modelo generativo multivista."}
               </p>
             </>
@@ -2013,7 +2024,7 @@ export function ImageTo3DStudio() {
               </div>
               <div className="hidden-multiview-note">
                 <EyeOff size={15} />
-                <span><strong>Contrato interno de 8 vistas</strong><small>serão geradas e consumidas pelo reconstrutor sem poluir a interface</small></span>
+                <span><strong>Reconstrução frontal local</strong><small>pose, máscara e prior anatômico estimam a profundidade sem serviço externo</small></span>
               </div>
           <div className="mode-grid">
             <button
@@ -2089,7 +2100,7 @@ export function ImageTo3DStudio() {
                     // eslint-disable-next-line @next/next/no-img-element
                     <img src={directionImages[direction.id]} alt={`Personagem em ${direction.label.toLowerCase()}`} />
                   ) : (
-                    <div className="direction-placeholder"><Sparkles size={18} /><span>{spriteEngine === "canonical-local" ? "motor local MOB" : "local experimental"}</span></div>
+                    <div className="direction-placeholder"><Sparkles size={18} /><span>{spriteEngine === "canonical-local" ? "rig local MOB" : "local experimental"}</span></div>
                   )}
                   <small>{directionImages[direction.id] ? "sprite 2D pronto" : "clique em gerar"}</small>
                 </article>

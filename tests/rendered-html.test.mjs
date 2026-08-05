@@ -39,8 +39,8 @@ test("server-renders the Image to 3D studio", async () => {
   assert.match(html, /1, 2, 4 ou 8 direções/);
   assert.match(html, /não editável/);
   assert.match(html, /Quantidade de direções/);
-  assert.match(html, /Motor local MOB/);
-  assert.match(html, /8 vistas suas aprovadas · sem API/);
+  assert.match(html, /Rig local MOB/);
+  assert.match(html, /8 vistas fixas aprovadas · ainda sem treino/);
   assert.match(html, /nenhuma imagem sai deste dispositivo/);
   assert.match(html, /Local experimental/);
   assert.match(html, /Exportar spritesheet PNG/);
@@ -74,7 +74,7 @@ test("ships the canonical MOB example without coupling the tool to MOBs", async 
   assert.match(studio, /downloadDirectionSheet/);
   assert.match(studio, /Exportar spritesheet PNG/);
   assert.doesNotMatch(studio, /aguardando conexão do motor de IA/);
-  assert.match(studio, /Contrato interno de 8 vistas/);
+  assert.match(studio, /Reconstrução frontal local/);
   assert.match(studio, /Pixel nativo/);
   assert.match(studio, /Ferramentas de edição de pixels/);
   assert.match(studio, /Tamanho do pixel/);
@@ -93,6 +93,8 @@ test("ships the canonical MOB example without coupling the tool to MOBs", async 
   assert.match(studio, /PoseLandmarker/);
   assert.match(studio, /inferSemanticSkeleton/);
   assert.match(studio, /buildAnatomyPrimitives/);
+  assert.match(studio, /tryCreateWebGlRenderer/);
+  assert.match(studio, /createSoftwareVoxelRenderer/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   assert.doesNotMatch(studio, /PixelLab|PIXELLAB|\/api\/pixel-character/);
   assert.match(rigMetadata, /"author": "0xddneto"/);

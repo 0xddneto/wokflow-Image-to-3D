@@ -32,6 +32,8 @@ O motor principal é executado inteiramente no navegador: carrega o rig 2D canô
 
 As vistas estão em `public/models/mobs-canonical-directions`. O manifesto registra autoria, aprovação, direção, dimensões e SHA-256 de cada PNG. Essa primeira versão é especializada no corpo MOB; novos corpos e traits deverão entrar como folhas multivista próprias antes de alimentar o treinamento local.
 
+> Estado real: as oito vistas atuais são um rig canônico fixo, não um modelo treinado. Uma única folha ensina apenas um personagem e seria memorizada por uma rede. O gerador generalista exigirá um dataset de muitos personagens, cada um com a entrada frontal e as oito vistas-alvo aprovadas; o runtime continuará local e separado do Pixel 3D.
+
 ## Executar
 
 Requer Node.js 22.13 ou superior.
