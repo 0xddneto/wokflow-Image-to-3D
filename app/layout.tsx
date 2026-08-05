@@ -18,8 +18,8 @@ export async function generateMetadata(): Promise<Metadata> {
   const host = requestHeaders.get("x-forwarded-host") ?? requestHeaders.get("host") ?? "localhost:3000";
   const protocol = requestHeaders.get("x-forwarded-proto") ?? (host.startsWith("localhost") ? "http" : "https");
   const origin = `${protocol}://${host}`;
-  const title = "Image to 3D — Procedural Asset Studio";
-  const description = "Turn a character reference into segmented, editable voxel geometry and export a production-ready GLB.";
+  const title = "Image to 3D — Pixel Character & Voxel Studio";
+  const description = "Transforme uma referência em sprites direcionais ou em um personagem Pixel 3D com voxels editáveis e exportação GLB.";
 
   return {
     metadataBase: new URL(origin),

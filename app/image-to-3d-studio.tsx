@@ -1,11 +1,14 @@
 "use client";
 
 import {
+  Box,
   BoxSelect,
   Circle,
   Download,
   Eraser,
   Grid3X3,
+  EyeOff,
+  Images,
   LassoSelect,
   Minus,
   Move3D,
@@ -23,12 +26,20 @@ import {
   Wand2,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  FilesetResolver,
+  PoseLandmarker,
+  type NormalizedLandmark,
+} from "@mediapipe/tasks-vision";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
 
 type GenerationMode = "pixel" | "relief";
+type OutputMode = "pixel-character" | "pixel-3d";
+type DirectionCount = 1 | 2 | 4 | 8;
+type DirectionId = "south" | "south-east" | "east" | "north-east" | "north" | "north-west" | "west" | "south-west";
 type ViewName = "front" | "quarter" | "side";
 type PixelTool = "pencil" | "eraser" | "fill" | "eyedropper" | "box-select" | "wand" | "lasso" | "line" | "rectangle" | "circle";
 
@@ -104,6 +115,43 @@ type AnatomyProfile = {
   referenceHalfWidth: number;
 };
 
+type Point2 = { x: number; y: number };
+
+type SemanticMask = {
+  data: Float32Array;
+  width: number;
+  height: number;
+};
+
+type SemanticSkeleton = {
+  source: "mediapipe" | "stylized-prior";
+  shoulderLeft: Point2;
+  shoulderRight: Point2;
+  elbowLeft: Point2;
+  elbowRight: Point2;
+  wristLeft: Point2;
+  wristRight: Point2;
+  hipLeft: Point2;
+  hipRight: Point2;
+  kneeLeft: Point2;
+  kneeRight: Point2;
+  ankleLeft: Point2;
+  ankleRight: Point2;
+};
+
+type AnatomyPrimitive = {
+  kind: "ellipsoid" | "capsule";
+  partId: PartId;
+  center?: Point2;
+  a?: Point2;
+  b?: Point2;
+  radiusX: number;
+  radiusY: number;
+  radiusZ: number;
+  centerZ: number;
+  priority: number;
+};
+
 const PARTS: Array<{ id: PartId; label: string; depth: number }> = [
   { id: "head", label: "Cabeça", depth: 1.08 },
   { id: "torso", label: "Tronco", depth: 1.05 },
@@ -124,6 +172,8 @@ type BuildOptions = {
   resolution: number;
   depth: number;
   threshold: number;
+  poseLandmarks?: NormalizedLandmark[] | null;
+  personMask?: SemanticMask | null;
 };
 
 const EMPTY_METRICS: Metrics = {
@@ -133,6 +183,24 @@ const EMPTY_METRICS: Metrics = {
   elements: 0,
   triangles: 0,
   parts: 0,
+};
+
+const DIRECTIONS: Array<{ id: DirectionId; label: string; shortLabel: string }> = [
+  { id: "south", label: "Frente", shortLabel: "S" },
+  { id: "south-east", label: "Frente direita", shortLabel: "SE" },
+  { id: "east", label: "Direita", shortLabel: "E" },
+  { id: "north-east", label: "Costas direita", shortLabel: "NE" },
+  { id: "north", label: "Costas", shortLabel: "N" },
+  { id: "north-west", label: "Costas esquerda", shortLabel: "NW" },
+  { id: "west", label: "Esquerda", shortLabel: "W" },
+  { id: "south-west", label: "Frente esquerda", shortLabel: "SW" },
+];
+
+const DIRECTION_SETS: Record<DirectionCount, DirectionId[]> = {
+  1: ["south"],
+  2: ["south", "north"],
+  4: ["south", "east", "north", "west"],
+  8: DIRECTIONS.map((direction) => direction.id),
 };
 
 const PIXEL_TOOLS = [
@@ -224,39 +292,192 @@ function getPartDepthOffset(partId: PartId, bboxWidth: number) {
   return 0;
 }
 
-function buildDistanceField(mask: Uint8Array, width: number, height: number) {
-  const field = new Float32Array(width * height);
-  const diagonal = Math.SQRT2;
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const index = y * width + x;
-      field[index] = mask[index]
-        ? Math.min(x + 1, y + 1, width - x, height - y)
-        : 0;
-    }
+function inferSemanticSkeleton(
+  guides: AnatomyGuides,
+  width: number,
+  height: number,
+  poseLandmarks?: NormalizedLandmark[] | null,
+): SemanticSkeleton {
+  const bboxWidth = Math.max(1, guides.maxX - guides.minX + 1);
+  const bboxHeight = Math.max(1, guides.maxY - guides.minY + 1);
+  const fallback = (x: number, y: number): Point2 => ({
+    x: guides.centerX + bboxWidth * x,
+    y: guides.minY + bboxHeight * y,
+  });
+
+  const confidenceIndices = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28];
+  const shouldersY = poseLandmarks
+    ? ((poseLandmarks[11]?.y ?? 0) + (poseLandmarks[12]?.y ?? 0)) / 2
+    : 0;
+  const hipsY = poseLandmarks
+    ? ((poseLandmarks[23]?.y ?? 0) + (poseLandmarks[24]?.y ?? 0)) / 2
+    : 0;
+  const kneesY = poseLandmarks
+    ? ((poseLandmarks[25]?.y ?? 0) + (poseLandmarks[26]?.y ?? 0)) / 2
+    : 0;
+  const anklesY = poseLandmarks
+    ? ((poseLandmarks[27]?.y ?? 0) + (poseLandmarks[28]?.y ?? 0)) / 2
+    : 0;
+  const poseUsable = Boolean(
+    poseLandmarks
+    && poseLandmarks.length >= 29
+    && confidenceIndices.filter((index) => (poseLandmarks[index]?.visibility ?? 0) > 0.3).length >= 8
+    && shouldersY < hipsY
+    && hipsY < kneesY
+    && kneesY < anklesY,
+  );
+
+  if (!poseUsable || !poseLandmarks) {
+    return {
+      source: "stylized-prior",
+      shoulderLeft: fallback(-0.21, 0.43),
+      shoulderRight: fallback(0.21, 0.43),
+      elbowLeft: fallback(-0.3, 0.54),
+      elbowRight: fallback(0.3, 0.54),
+      wristLeft: fallback(-0.31, 0.65),
+      wristRight: fallback(0.31, 0.65),
+      hipLeft: fallback(-0.13, 0.69),
+      hipRight: fallback(0.13, 0.69),
+      kneeLeft: fallback(-0.12, 0.81),
+      kneeRight: fallback(0.12, 0.81),
+      ankleLeft: fallback(-0.11, 0.91),
+      ankleRight: fallback(0.11, 0.91),
+    };
   }
 
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const index = y * width + x;
-      if (!mask[index]) continue;
-      if (x > 0) field[index] = Math.min(field[index], field[index - 1] + 1);
-      if (y > 0) field[index] = Math.min(field[index], field[index - width] + 1);
-      if (x > 0 && y > 0) field[index] = Math.min(field[index], field[index - width - 1] + diagonal);
-      if (x + 1 < width && y > 0) field[index] = Math.min(field[index], field[index - width + 1] + diagonal);
-    }
+  const point = (index: number): Point2 => ({
+    x: THREE.MathUtils.clamp(poseLandmarks[index].x * width, guides.minX, guides.maxX),
+    y: THREE.MathUtils.clamp(poseLandmarks[index].y * height, guides.minY, guides.maxY),
+  });
+  const screenPair = (first: number, second: number) => {
+    const points = [point(first), point(second)].sort((a, b) => a.x - b.x);
+    return { left: points[0], right: points[1] };
+  };
+  const shoulders = screenPair(11, 12);
+  const elbows = screenPair(13, 14);
+  const wrists = screenPair(15, 16);
+  const hips = screenPair(23, 24);
+  const knees = screenPair(25, 26);
+  const ankles = screenPair(27, 28);
+  return {
+    source: "mediapipe",
+    shoulderLeft: shoulders.left,
+    shoulderRight: shoulders.right,
+    elbowLeft: elbows.left,
+    elbowRight: elbows.right,
+    wristLeft: wrists.left,
+    wristRight: wrists.right,
+    hipLeft: hips.left,
+    hipRight: hips.right,
+    kneeLeft: knees.left,
+    kneeRight: knees.right,
+    ankleLeft: ankles.left,
+    ankleRight: ankles.right,
+  };
+}
+
+function buildAnatomyPrimitives(
+  samples: PixelSample[],
+  guides: AnatomyGuides,
+  skeleton: SemanticSkeleton,
+) {
+  const bboxWidth = Math.max(1, guides.maxX - guides.minX + 1);
+  const headSamples = samples.filter((sample) => sample.y <= guides.headBottom);
+  const headMinX = Math.min(...headSamples.map((sample) => sample.x));
+  const headMaxX = Math.max(...headSamples.map((sample) => sample.x));
+  const headRadiusX = Math.max(bboxWidth * 0.25, (headMaxX - headMinX + 1) / 2);
+  const headRadiusY = Math.max(2, (guides.headBottom - guides.minY + 1) / 2);
+  const headCenter = {
+    x: (headMinX + headMaxX) / 2,
+    y: guides.minY + headRadiusY,
+  };
+  const shoulderCenter = {
+    x: (skeleton.shoulderLeft.x + skeleton.shoulderRight.x) / 2,
+    y: (skeleton.shoulderLeft.y + skeleton.shoulderRight.y) / 2,
+  };
+  const hipCenter = {
+    x: (skeleton.hipLeft.x + skeleton.hipRight.x) / 2,
+    y: (skeleton.hipLeft.y + skeleton.hipRight.y) / 2,
+  };
+  const shoulderHalfWidth = Math.max(
+    bboxWidth * 0.18,
+    Math.abs(skeleton.shoulderRight.x - skeleton.shoulderLeft.x) / 2,
+  );
+  const torsoHeight = Math.max(bboxWidth * 0.28, hipCenter.y - shoulderCenter.y);
+
+  const ellipsoid = (
+    partId: PartId,
+    center: Point2,
+    radiusX: number,
+    radiusY: number,
+    radiusZ: number,
+    centerZ = 0,
+    priority = 0,
+  ): AnatomyPrimitive => ({
+    kind: "ellipsoid", partId, center, radiusX, radiusY, radiusZ, centerZ, priority,
+  });
+  const capsule = (
+    partId: PartId,
+    a: Point2,
+    b: Point2,
+    radius: number,
+    radiusZ: number,
+    centerZ = 0,
+    priority = 0,
+  ): AnatomyPrimitive => ({
+    kind: "capsule", partId, a, b, radiusX: radius, radiusY: radius, radiusZ, centerZ, priority,
+  });
+
+  return [
+    ellipsoid("head", headCenter, headRadiusX * 0.98, headRadiusY * 1.02, headRadiusX * 0.84, 0, 6),
+    ellipsoid("head", { x: headMinX + bboxWidth * 0.03, y: headCenter.y + headRadiusY * 0.12 }, bboxWidth * 0.075, bboxWidth * 0.09, bboxWidth * 0.06, -bboxWidth * 0.02, 7),
+    ellipsoid("head", { x: headMaxX - bboxWidth * 0.03, y: headCenter.y + headRadiusY * 0.12 }, bboxWidth * 0.075, bboxWidth * 0.09, bboxWidth * 0.06, -bboxWidth * 0.02, 7),
+    capsule("torso", { x: guides.centerX, y: guides.headBottom - bboxWidth * 0.01 }, shoulderCenter, bboxWidth * 0.065, bboxWidth * 0.06, -bboxWidth * 0.05, 3),
+    ellipsoid("torso", { x: shoulderCenter.x, y: shoulderCenter.y + torsoHeight * 0.44 }, shoulderHalfWidth * 1.08, torsoHeight * 0.56, bboxWidth * 0.2, -bboxWidth * 0.015, 4),
+    ellipsoid("torso", { x: hipCenter.x, y: shoulderCenter.y + torsoHeight * 0.7 }, shoulderHalfWidth * 1.04, torsoHeight * 0.4, bboxWidth * 0.235, bboxWidth * 0.015, 5),
+    capsule("left-arm", skeleton.shoulderLeft, skeleton.elbowLeft, bboxWidth * 0.075, bboxWidth * 0.07, -bboxWidth * 0.065, 8),
+    capsule("right-arm", skeleton.shoulderRight, skeleton.elbowRight, bboxWidth * 0.075, bboxWidth * 0.07, bboxWidth * 0.065, 8),
+    capsule("left-arm", skeleton.elbowLeft, skeleton.wristLeft, bboxWidth * 0.062, bboxWidth * 0.06, -bboxWidth * 0.065, 9),
+    capsule("right-arm", skeleton.elbowRight, skeleton.wristRight, bboxWidth * 0.062, bboxWidth * 0.06, bboxWidth * 0.065, 9),
+    ellipsoid("left-hand", skeleton.wristLeft, bboxWidth * 0.075, bboxWidth * 0.095, bboxWidth * 0.065, -bboxWidth * 0.075, 10),
+    ellipsoid("right-hand", skeleton.wristRight, bboxWidth * 0.075, bboxWidth * 0.095, bboxWidth * 0.065, bboxWidth * 0.075, 10),
+    capsule("left-leg", skeleton.hipLeft, skeleton.kneeLeft, bboxWidth * 0.09, bboxWidth * 0.085, -bboxWidth * 0.045, 8),
+    capsule("right-leg", skeleton.hipRight, skeleton.kneeRight, bboxWidth * 0.09, bboxWidth * 0.085, bboxWidth * 0.045, 8),
+    capsule("left-leg", skeleton.kneeLeft, skeleton.ankleLeft, bboxWidth * 0.072, bboxWidth * 0.07, -bboxWidth * 0.045, 9),
+    capsule("right-leg", skeleton.kneeRight, skeleton.ankleRight, bboxWidth * 0.072, bboxWidth * 0.07, bboxWidth * 0.045, 9),
+    ellipsoid("left-foot", { x: skeleton.ankleLeft.x, y: guides.footStart + bboxWidth * 0.055 }, bboxWidth * 0.105, bboxWidth * 0.075, bboxWidth * 0.14, -bboxWidth * 0.035, 10),
+    ellipsoid("right-foot", { x: skeleton.ankleRight.x, y: guides.footStart + bboxWidth * 0.055 }, bboxWidth * 0.105, bboxWidth * 0.075, bboxWidth * 0.14, bboxWidth * 0.035, 10),
+  ];
+}
+
+function samplePrimitiveDepth(primitive: AnatomyPrimitive, x: number, y: number) {
+  let normalizedDistance = Number.POSITIVE_INFINITY;
+  if (primitive.kind === "ellipsoid" && primitive.center) {
+    const dx = (x - primitive.center.x) / Math.max(1, primitive.radiusX);
+    const dy = (y - primitive.center.y) / Math.max(1, primitive.radiusY);
+    normalizedDistance = dx * dx + dy * dy;
+  } else if (primitive.a && primitive.b) {
+    const abX = primitive.b.x - primitive.a.x;
+    const abY = primitive.b.y - primitive.a.y;
+    const lengthSquared = Math.max(1e-6, abX * abX + abY * abY);
+    const t = THREE.MathUtils.clamp(
+      ((x - primitive.a.x) * abX + (y - primitive.a.y) * abY) / lengthSquared,
+      0,
+      1,
+    );
+    const closestX = primitive.a.x + abX * t;
+    const closestY = primitive.a.y + abY * t;
+    const dx = (x - closestX) / Math.max(1, primitive.radiusX);
+    const dy = (y - closestY) / Math.max(1, primitive.radiusY);
+    normalizedDistance = dx * dx + dy * dy;
   }
-  for (let y = height - 1; y >= 0; y -= 1) {
-    for (let x = width - 1; x >= 0; x -= 1) {
-      const index = y * width + x;
-      if (!mask[index]) continue;
-      if (x + 1 < width) field[index] = Math.min(field[index], field[index + 1] + 1);
-      if (y + 1 < height) field[index] = Math.min(field[index], field[index + width] + 1);
-      if (x + 1 < width && y + 1 < height) field[index] = Math.min(field[index], field[index + width + 1] + diagonal);
-      if (x > 0 && y + 1 < height) field[index] = Math.min(field[index], field[index + width - 1] + diagonal);
-    }
-  }
-  return field;
+  if (normalizedDistance > 1) return null;
+  return {
+    depth: primitive.radiusZ * Math.sqrt(Math.max(0, 1 - normalizedDistance)),
+    centerZ: primitive.centerZ,
+    score: primitive.priority + (1 - normalizedDistance),
+    partId: primitive.partId,
+  };
 }
 
 function buildAnatomyProfile(samples: PixelSample[], partId: PartId): AnatomyProfile {
@@ -474,9 +695,22 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
       const green = pixels[offset + 1];
       const blue = pixels[offset + 2];
       const alpha = pixels[offset + 3];
+      const semanticX = options.personMask
+        ? Math.min(options.personMask.width - 1, Math.floor((x / width) * options.personMask.width))
+        : 0;
+      const semanticY = options.personMask
+        ? Math.min(options.personMask.height - 1, Math.floor((y / height) * options.personMask.height))
+        : 0;
+      const semanticConfidence = options.personMask
+        ? options.personMask.data[semanticY * options.personMask.width + semanticX]
+        : 0;
       const foreground = hasTransparency
         ? alpha > (effectiveResolution > maxDimension ? 72 : 28)
-        : alpha > 28 && colorDistance(red, green, blue, background) > options.threshold;
+        : options.personMask
+          ? alpha > 28
+            && semanticConfidence > 0.22
+            && colorDistance(red, green, blue, background) > options.threshold * 0.3
+          : alpha > 28 && colorDistance(red, green, blue, background) > options.threshold;
 
       if (!foreground) continue;
       samples.push({ x, y, red, green, blue });
@@ -495,13 +729,19 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
   const bboxWidth = Math.max(1, maxX - minX);
   const cell = 3.2 / Math.max(width, height);
   const anatomy = inferAnatomyGuides(foregroundMask, width, minX, maxX, minY, maxY);
+  const skeleton = inferSemanticSkeleton(anatomy, width, height, options.poseLandmarks);
+  const primitives = buildAnatomyPrimitives(samples, anatomy, skeleton);
   const samplesByPart = new Map<PartId, PixelSample[]>();
   const partByPixel = new Int8Array(width * height);
   partByPixel.fill(-1);
   for (const part of PARTS) samplesByPart.set(part.id, []);
 
   for (const sample of samples) {
-    const partId = classifyCharacterPart(sample.x, sample.y, anatomy);
+    const primitiveHits = primitives
+      .map((primitive) => samplePrimitiveDepth(primitive, sample.x, sample.y))
+      .filter((hit): hit is NonNullable<typeof hit> => Boolean(hit));
+    const owner = primitiveHits.sort((a, b) => b.score - a.score)[0];
+    const partId = owner?.partId ?? classifyCharacterPart(sample.x, sample.y, anatomy);
     samplesByPart.get(partId)?.push(sample);
     partByPixel[sample.y * width + sample.x] = PARTS.findIndex((part) => part.id === partId);
   }
@@ -520,32 +760,38 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
     const profile = partDefinition ? profilesByPart.get(partDefinition.id) : undefined;
     if (!partDefinition || !profile) continue;
     const maxPartRadius = Math.max(3, Math.round(bboxWidth * 0.48));
-    const radius = THREE.MathUtils.clamp(
-      Math.ceil(getAnatomicalRadius(
+    const primitiveHits = primitives
+      .map((primitive) => samplePrimitiveDepth(primitive, sample.x, sample.y))
+      .filter((hit): hit is NonNullable<typeof hit> => Boolean(hit))
+      .filter((hit) => hit.partId === partDefinition.id);
+    let minDepth = Number.POSITIVE_INFINITY;
+    let maxDepth = Number.NEGATIVE_INFINITY;
+    for (const hit of primitiveHits) {
+      minDepth = Math.min(minDepth, (hit.centerZ - hit.depth) * depthScale);
+      maxDepth = Math.max(maxDepth, (hit.centerZ + hit.depth) * depthScale);
+    }
+    if (primitiveHits.length === 0) {
+      const radius = getAnatomicalRadius(
         sample,
         profile,
         partDefinition.id,
         partDefinition.depth * depthScale,
-      )),
-      1,
-      maxPartRadius,
-    );
-    const frontDepth = THREE.MathUtils.clamp(
-      Math.ceil(getAnatomicalFrontDepth(
+      );
+      const frontDepth = getAnatomicalFrontDepth(
         sample,
         profile,
         partDefinition.id,
         partDefinition.depth * depthScale,
-      )),
-      1,
-      maxPartRadius,
-    );
-    const offset = getPartDepthOffset(partDefinition.id, bboxWidth);
+      );
+      const offset = getPartDepthOffset(partDefinition.id, bboxWidth);
+      minDepth = -radius + offset;
+      maxDepth = frontDepth + offset;
+    }
     intervals[sample.y * width + sample.x] = {
       ...sample,
       partId: partDefinition.id,
-      minZ: -radius + offset,
-      maxZ: frontDepth + offset,
+      minZ: THREE.MathUtils.clamp(Math.floor(minDepth), -maxPartRadius, maxPartRadius),
+      maxZ: THREE.MathUtils.clamp(Math.ceil(maxDepth), -maxPartRadius, maxPartRadius),
     };
   }
 
@@ -621,7 +867,9 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
     mesh.userData.renderPixelSize = 0.96;
     mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     mesh.castShadow = true;
-    mesh.receiveShadow = true;
+    // Keep a floor shadow without letting thousands of voxels shadow each other.
+    // Self-shadowing turned the source outlines into false dark anatomical cuts.
+    mesh.receiveShadow = false;
 
     const matrix = new THREE.Matrix4();
     const position = new THREE.Vector3();
@@ -679,7 +927,8 @@ function createProceduralAsset(image: HTMLImageElement, options: BuildOptions) {
 
   model.userData.generation = {
     mode: options.mode,
-    segmentation: "adaptive-watertight-anatomical-volume-v4",
+    segmentation: "mediapipe-parametric-anatomy-v5",
+    poseSource: skeleton.source,
     sourceWidth: image.naturalWidth,
     sourceHeight: image.naturalHeight,
     sampleWidth: width,
@@ -717,8 +966,12 @@ export function ImageTo3DStudio() {
   const controlsRef = useRef<OrbitControls | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sourceImageRef = useRef<HTMLImageElement | null>(null);
+  const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
   const spinRef = useRef(false);
+  const outputModeRef = useRef<OutputMode>("pixel-3d");
 
+  const [outputMode, setOutputMode] = useState<OutputMode>("pixel-3d");
+  const [directionCount, setDirectionCount] = useState<DirectionCount>(8);
   const [mode, setMode] = useState<GenerationMode>("relief");
   const [resolution, setResolution] = useState(256);
   const [depth, setDepth] = useState(0.42);
@@ -735,11 +988,98 @@ export function ImageTo3DStudio() {
   const [selectionColor, setSelectionColor] = useState("#ffffff");
   const [activeTool, setActiveTool] = useState<PixelTool | null>("box-select");
   const [pixelSize, setPixelSize] = useState(0.98);
+  const [poseReady, setPoseReady] = useState(false);
+  const [poseLandmarks, setPoseLandmarks] = useState<NormalizedLandmark[] | null>(null);
+  const [personMask, setPersonMask] = useState<SemanticMask | null>(null);
+  const [poseEngineStatus, setPoseEngineStatus] = useState("carregando pose…");
   const activeToolRef = useRef<PixelTool | null>(activeTool);
   const selectionColorRef = useRef(selectionColor);
 
   useEffect(() => { activeToolRef.current = activeTool; }, [activeTool]);
   useEffect(() => { selectionColorRef.current = selectionColor; }, [selectionColor]);
+  useEffect(() => { outputModeRef.current = outputMode; }, [outputMode]);
+
+  const selectedDirections = DIRECTION_SETS[directionCount]
+    .map((id) => DIRECTIONS.find((direction) => direction.id === id))
+    .filter((direction): direction is (typeof DIRECTIONS)[number] => Boolean(direction));
+
+  const changeOutputMode = useCallback((nextMode: OutputMode) => {
+    outputModeRef.current = nextMode;
+    setOutputMode(nextMode);
+    spinRef.current = false;
+    setAutoRotate(false);
+    setActiveTool(nextMode === "pixel-3d" ? "box-select" : null);
+    setSelectedPixels([]);
+    setStatus(
+      nextMode === "pixel-3d"
+        ? "Reconstrução 3D editável ativa"
+        : "Escolha 1, 2, 4 ou 8 direções",
+    );
+  }, []);
+
+  const requestDirectionalGeneration = useCallback(() => {
+    if (directionCount === 1) {
+      setStatus("1 direção pronta · referência frontal preservada");
+      return;
+    }
+    setStatus(`Contrato de ${directionCount} direções pronto · aguardando conexão do motor de IA`);
+  }, [directionCount]);
+
+  const downloadFrontSprite = useCallback(() => {
+    if (directionCount !== 1) return;
+    const link = document.createElement("a");
+    link.href = preview;
+    link.download = `${fileName.replace(/\.[^.]+.*$/, "") || "pixel-character"}-south.png`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setStatus("Sprite frontal exportado");
+  }, [directionCount, fileName, preview]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let detector: PoseLandmarker | null = null;
+    const initializePose = async () => {
+      try {
+        const vision = await FilesetResolver.forVisionTasks("/mediapipe/wasm");
+        const options = {
+          baseOptions: {
+            modelAssetPath: "/models/pose_landmarker_lite.task",
+            delegate: "GPU" as const,
+          },
+          runningMode: "IMAGE" as const,
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.2,
+          minPosePresenceConfidence: 0.2,
+          outputSegmentationMasks: true,
+        };
+        try {
+          detector = await PoseLandmarker.createFromOptions(vision, options);
+        } catch {
+          detector = await PoseLandmarker.createFromOptions(vision, {
+            ...options,
+            baseOptions: { ...options.baseOptions, delegate: "CPU" as const },
+          });
+        }
+        if (cancelled) {
+          detector.close();
+          return;
+        }
+        poseLandmarkerRef.current = detector;
+        setPoseReady(true);
+        setPoseEngineStatus("pose ML pronta");
+      } catch {
+        setPoseEngineStatus("prior estilizado ativo");
+        setPoseReady(true);
+      }
+    };
+    void initializePose();
+    return () => {
+      cancelled = true;
+      poseLandmarkerRef.current = null;
+      detector?.close();
+    };
+  }, []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1106,19 +1446,67 @@ export function ImageTo3DStudio() {
     image.decoding = "async";
     image.onload = () => {
       sourceImageRef.current = image;
+      setPoseLandmarks(null);
+      setPersonMask(null);
       setPreview(url);
       setFileName(name);
-      setStatus("Gerando geometria…");
+      setStatus(outputModeRef.current === "pixel-3d" ? "Gerando geometria…" : "Referência frontal pronta");
     };
     image.onerror = () => setStatus("Não foi possível abrir essa imagem");
     image.src = url;
   }, []);
 
   useEffect(() => {
+    // The image loader completes asynchronously; this effect only starts it.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadImage("/examples/mobs-base.png", "mobs-base.png · example");
   }, [loadImage]);
 
   useEffect(() => {
+    if (!poseReady) return;
+    const image = sourceImageRef.current;
+    const detector = poseLandmarkerRef.current;
+    if (!image || !detector) {
+      setPoseLandmarks(null);
+      setPersonMask(null);
+      setPoseEngineStatus("prior estilizado ativo");
+      return;
+    }
+    try {
+      const detectionCanvas = document.createElement("canvas");
+      const detectionScale = Math.max(1, 512 / Math.max(image.naturalWidth, image.naturalHeight));
+      detectionCanvas.width = Math.round(image.naturalWidth * detectionScale);
+      detectionCanvas.height = Math.round(image.naturalHeight * detectionScale);
+      const detectionContext = detectionCanvas.getContext("2d");
+      if (!detectionContext) throw new Error("Canvas indisponível");
+      detectionContext.fillStyle = "#ffffff";
+      detectionContext.fillRect(0, 0, detectionCanvas.width, detectionCanvas.height);
+      detectionContext.imageSmoothingEnabled = false;
+      detectionContext.drawImage(image, 0, 0, detectionCanvas.width, detectionCanvas.height);
+      const result = detector.detect(detectionCanvas);
+      const detectedPose = result.landmarks[0] ?? null;
+      const detectedMask = result.segmentationMasks?.[0];
+      setPoseLandmarks(detectedPose);
+      setPersonMask(detectedMask ? {
+        data: new Float32Array(detectedMask.getAsFloat32Array()),
+        width: detectedMask.width,
+        height: detectedMask.height,
+      } : null);
+      setPoseEngineStatus(
+        detectedPose
+          ? detectedMask ? "pose + máscara ML detectadas" : "pose ML detectada"
+          : "prior estilizado ativo",
+      );
+      result.segmentationMasks?.forEach((mask) => mask.close());
+    } catch {
+      setPoseLandmarks(null);
+      setPersonMask(null);
+      setPoseEngineStatus("prior estilizado ativo");
+    }
+  }, [poseReady, preview]);
+
+  useEffect(() => {
+    if (outputMode !== "pixel-3d") return;
     const timer = window.setTimeout(() => {
       const image = sourceImageRef.current;
       const root = rootRef.current;
@@ -1135,6 +1523,8 @@ export function ImageTo3DStudio() {
           resolution,
           depth,
           threshold,
+          poseLandmarks,
+          personMask,
         });
         root.add(result.group);
         root.rotation.set(0, 0, 0);
@@ -1152,7 +1542,7 @@ export function ImageTo3DStudio() {
       }
     }, 100);
     return () => window.clearTimeout(timer);
-  }, [mode, resolution, depth, threshold, preview]);
+  }, [mode, outputMode, resolution, depth, threshold, preview, poseLandmarks, personMask]);
 
   const handleFile = useCallback((file?: File) => {
     if (!file) return;
@@ -1260,6 +1650,8 @@ export function ImageTo3DStudio() {
     const last = selectedPixels.at(-1);
     const colors = last ? getPixelMesh(last.partId)?.userData.currentColors as number[][] | undefined : undefined;
     const values = last ? colors?.[last.instanceId] : undefined;
+    // Mirror the selected voxel color in the native color input.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (values) setSelectionColor(`#${new THREE.Color().fromArray(values).getHexString(THREE.SRGBColorSpace)}`);
   }, [getPixelMesh, renderSelection, selectedPixels]);
 
@@ -1408,18 +1800,18 @@ export function ImageTo3DStudio() {
           <span>IMAGE<span>→</span>3D</span>
         </div>
         <div className="build-tag">
-          <span className="status-dot" /> watertight anatomy engine · alpha 0.6
+          <span className="status-dot" /> dual output · semantic anatomy v5 · {poseEngineStatus}
         </div>
       </header>
 
       <section className="intro">
         <div>
-          <p className="intro-kicker">Reference-driven asset generation</p>
-          <h1>Uma imagem entra. <em>Geometria editável sai.</em></h1>
+          <p className="intro-kicker">Reference-driven character generation</p>
+          <h1>Uma imagem entra. <em>Sprites ou Pixel 3D saem.</em></h1>
         </div>
         <p className="intro-copy">
-          A silhueta é inflada como um campo 3D: a frente preserva o sprite e o
-          interior forma volume arredondado, sem esticar a imagem para trás.
+          Gere um personagem em até oito direções ou use oito vistas internamente
+          para reconstruir um Pixel 3D com voxels editáveis.
         </p>
       </section>
 
@@ -1455,9 +1847,71 @@ export function ImageTo3DStudio() {
 
           <div className="divider" />
           <div className="panel-heading">
-            <h3>Motor</h3>
+            <h3>Resultado</h3>
             <span className="step-number">02</span>
           </div>
+          <div className="output-mode-grid" role="radiogroup" aria-label="Tipo de resultado">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={outputMode === "pixel-character"}
+              className={`output-mode-button ${outputMode === "pixel-character" ? "is-active" : ""}`}
+              onClick={() => changeOutputMode("pixel-character")}
+            >
+              <Images size={18} />
+              <span><strong>Pixel Character</strong><small>1, 2, 4 ou 8 direções · não editável</small></span>
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={outputMode === "pixel-3d"}
+              className={`output-mode-button ${outputMode === "pixel-3d" ? "is-active" : ""}`}
+              onClick={() => changeOutputMode("pixel-3d")}
+            >
+              <Box size={18} />
+              <span><strong>Pixel 3D</strong><small>multivista interna · voxels editáveis</small></span>
+            </button>
+          </div>
+
+          {outputMode === "pixel-character" ? (
+            <>
+              <div className="divider" />
+              <div className="panel-heading">
+                <h3>Direções</h3>
+                <span className="step-number">03</span>
+              </div>
+              <div className="direction-count" role="radiogroup" aria-label="Quantidade de direções">
+                {([1, 2, 4, 8] as DirectionCount[]).map((count) => (
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={directionCount === count}
+                    className={directionCount === count ? "is-active" : ""}
+                    key={count}
+                    onClick={() => setDirectionCount(count)}
+                  >
+                    <strong>{count}</strong><span>{count === 1 ? "direção" : "direções"}</span>
+                  </button>
+                ))}
+              </div>
+              <button className="generate-direction-button" type="button" onClick={requestDirectionalGeneration}>
+                <Sparkles size={15} /> Gerar {directionCount} {directionCount === 1 ? "direção" : "direções"}
+              </button>
+              <p className="engine-contract-note">
+                A referência frontal é preservada. As demais vistas só serão liberadas por um motor de IA multivista real — nunca por espelhamento falso.
+              </p>
+            </>
+          ) : (
+            <>
+              <div className="divider" />
+              <div className="panel-heading">
+                <h3>Geometria</h3>
+                <span className="step-number">03</span>
+              </div>
+              <div className="hidden-multiview-note">
+                <EyeOff size={15} />
+                <span><strong>Contrato interno de 8 vistas</strong><small>serão geradas e consumidas pelo reconstrutor sem poluir a interface</small></span>
+              </div>
           <div className="mode-grid">
             <button
               className={`mode-button ${mode === "pixel" ? "is-active" : ""}`}
@@ -1517,13 +1971,31 @@ export function ImageTo3DStudio() {
               />
             </label>
           </div>
+            </>
+          )}
         </aside>
 
-        <div className={`viewer ${activeTool ? "is-editing" : "is-navigating"}`} ref={viewerRef}>
-          <canvas ref={canvasRef} aria-label="Visualização tridimensional gerada" />
+        <div className={`viewer ${outputMode === "pixel-character" ? "is-character-output" : activeTool ? "is-editing" : "is-navigating"}`} ref={viewerRef}>
+          <canvas ref={canvasRef} aria-label="Visualização tridimensional gerada" aria-hidden={outputMode === "pixel-character"} />
+          {outputMode === "pixel-character" && (
+            <div className={`direction-preview-grid directions-${directionCount}`} aria-label={`Prévia de ${directionCount} direções`}>
+              {selectedDirections.map((direction) => (
+                <article className={`direction-card ${direction.id === "south" ? "is-ready" : "is-waiting"}`} key={direction.id}>
+                  <div className="direction-card-label"><strong>{direction.shortLabel}</strong><span>{direction.label}</span></div>
+                  {direction.id === "south" ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={preview} alt={`Personagem em ${direction.label.toLowerCase()}`} />
+                  ) : (
+                    <div className="direction-placeholder"><Sparkles size={18} /><span>motor IA</span></div>
+                  )}
+                  <small>{direction.id === "south" ? "referência preservada" : "aguardando geração real"}</small>
+                </article>
+              ))}
+            </div>
+          )}
           <div className="viewer-top">
             <span className="engine-tag"><span className="status-dot" /> {status}</span>
-            <div className="view-controls" aria-label="Vistas do modelo">
+            {outputMode === "pixel-3d" && <div className="view-controls" aria-label="Vistas do modelo">
               {(["front", "quarter", "side"] as ViewName[]).map((view) => (
                 <button
                   key={view}
@@ -1534,28 +2006,61 @@ export function ImageTo3DStudio() {
                   {view === "front" ? "Frente" : view === "quarter" ? "3/4" : "Lado"}
                 </button>
               ))}
-            </div>
+            </div>}
           </div>
           <div className="viewer-bottom">
             <div className="viewer-title">
-              <small>local isometric preview</small>
-              <strong>{mode === "pixel" ? "Editable voxel character" : "Rounded voxel character"}</strong>
+              <small>{outputMode === "pixel-3d" ? "local isometric preview" : "directional sprite set"}</small>
+              <strong>{outputMode === "pixel-3d" ? mode === "pixel" ? "Editable voxel character" : "Rounded voxel character" : `${directionCount} ${directionCount === 1 ? "direção" : "direções"} · saída não editável`}</strong>
             </div>
-            <button
+            {outputMode === "pixel-3d" && <button
               className={`spin-button ${autoRotate ? "is-active" : ""}`}
               type="button"
               onClick={toggleSpin}
             >
               <RotateCw size={13} /> Auto-orbit
-            </button>
+            </button>}
           </div>
         </div>
 
         <aside className="inspector">
+          {outputMode === "pixel-character" ? (
+            <div className="direction-inspector">
+              <div className="panel-heading">
+                <h2>Pixel Character</h2>
+                <span className="step-number">04</span>
+              </div>
+              <div className="direction-readiness">
+                {selectedDirections.map((direction) => (
+                  <div className={direction.id === "south" ? "is-ready" : ""} key={direction.id}>
+                    <span>{direction.shortLabel} · {direction.label}</span>
+                    <b>{direction.id === "south" ? "pronta" : "motor IA"}</b>
+                  </div>
+                ))}
+              </div>
+              <div className="divider" />
+              <div className="non-editable-contract">
+                <Images size={18} />
+                <strong>Sprites fechados</strong>
+                <p>Neste modo as direções são resultado final para o jogo. Não recebem ferramentas de voxel, movimento ou GLB.</p>
+              </div>
+              <button
+                className="export-button"
+                type="button"
+                disabled={directionCount !== 1}
+                onClick={downloadFrontSprite}
+              >
+                <Download size={16} /> {directionCount === 1 ? "Exportar PNG" : "Aguardando motor multivista"}
+              </button>
+              <p className="privacy-note">
+                <ShieldCheck size={14} /> A referência não é enviada a nenhum serviço enquanto o adaptador de IA não estiver conectado.
+              </p>
+            </div>
+          ) : (<>
           <div>
             <div className="panel-heading">
               <h2>Pixels</h2>
-              <span className="step-number">03</span>
+              <span className="step-number">04</span>
             </div>
             <div className="pixel-tool-grid" role="toolbar" aria-label="Ferramentas de edição de pixels">
               {PIXEL_TOOLS.map(({ id, label, icon: Icon }) => (
@@ -1681,6 +2186,7 @@ export function ImageTo3DStudio() {
               <ShieldCheck size={14} /> A imagem é processada neste dispositivo nesta versão.
             </p>
           </div>
+          </>)}
         </aside>
       </section>
 
@@ -1691,19 +2197,19 @@ export function ImageTo3DStudio() {
           <p>PNG transparente, sprite, render ou fotografia com fundo simples.</p>
         </article>
         <article className="workflow-step">
-          <span>02 / SEGMENT</span>
-          <h3>Corpo dividido</h3>
-          <p>A máscara e as proporções inferem cabeça, tronco, braços, mãos, pernas e pés.</p>
+          <span>02 / MULTIVIEW</span>
+          <h3>Identidade em direções</h3>
+          <p>O Pixel Character entrega 1, 2, 4 ou 8 sprites. O Pixel 3D solicita oito vistas internamente.</p>
         </article>
         <article className="workflow-step">
-          <span>03 / BUILD</span>
-          <h3>Frente pixel a pixel</h3>
-          <p>A referência permanece intacta; uma grade adaptativa constrói volumes contínuos e trata linhas escuras como decalques.</p>
+          <span>03 / RECONSTRUCT</span>
+          <h3>Corpo dividido</h3>
+          <p>Pose, máscara e concordância entre vistas posicionam volumes, membros e profundidade sem transformar contornos em buracos.</p>
         </article>
         <article className="workflow-step">
           <span>04 / EDIT + SHIP</span>
-          <h3>GLB ainda editável</h3>
-          <p>Recolora, mova ou remova partes e voxels individuais antes de exportar.</p>
+          <h3>Edição só no Pixel 3D</h3>
+          <p>Sprites saem prontos; no 3D, recolora, mova ou remova voxels individuais antes de exportar o GLB.</p>
         </article>
       </section>
     </main>
