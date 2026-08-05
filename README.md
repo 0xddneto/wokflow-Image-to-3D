@@ -5,7 +5,7 @@ Estúdio com dois resultados separados a partir da mesma referência:
 - **Pixel Character:** conjunto 2D não editável de 1, 2, 4 ou 8 direções para uso direto no jogo;
 - **Pixel 3D:** reconstrução voxel editável e exportável como GLB.
 
-No Pixel 3D, o contrato do pipeline prevê oito vistas geradas internamente e ocultas na interface comum. No Pixel Character, o modo principal envia a referência frontal a um motor de IA multivista e recebe oito sprites 2D coerentes. A geometria voxel nunca é usada para fabricar sprites 2D.
+No Pixel 3D, o contrato do pipeline prevê oito vistas geradas internamente e ocultas na interface comum. No Pixel Character, o modo principal usa as oito vistas 2D canônicas criadas e aprovadas pelo autor do MOB. A geometria voxel e o antigo modelo 3D rejeitado nunca são usados para fabricar sprites 2D.
 
 ## Reconstrução Pixel 3D atual
 
@@ -28,7 +28,9 @@ O detector e os arquivos WASM estão em `public/models` e `public/mediapipe`, po
 - Pixel Character não oferece edição voxel e exporta uma spritesheet PNG;
 - Pixel 3D mantém as oito imagens intermediárias fora do fluxo visual normal, mas deverá conservar diagnóstico técnico para QA.
 
-O adaptador atual usa a API v2 do PixelLab somente no servidor. O template Canvas local continua disponível como modo experimental rápido, explicitamente separado do resultado de produção. Essa fronteira permite substituir o provedor por um modelo próprio no futuro sem alterar o editor ou o formato da spritesheet.
+O motor principal é executado inteiramente no navegador: carrega o rig 2D canônico, compara sua paleta com a referência e reutiliza os pixels aprovados sem reamostragem quando a base coincide. Em variantes cromáticas, transfere índices de paleta sem mudar anatomia, contorno ou transparência. O template Canvas antigo continua disponível somente como comparação experimental.
+
+As vistas estão em `public/models/mobs-canonical-directions`. O manifesto registra autoria, aprovação, direção, dimensões e SHA-256 de cada PNG. Essa primeira versão é especializada no corpo MOB; novos corpos e traits deverão entrar como folhas multivista próprias antes de alimentar o treinamento local.
 
 ## Executar
 
@@ -36,12 +38,10 @@ Requer Node.js 22.13 ou superior.
 
 ```bash
 npm install
-Copy-Item .env.example .env.local
-# preencha PIXELLAB_SECRET em .env.local
 npm run dev
 ```
 
-A chave nunca deve usar prefixo `NEXT_PUBLIC_`.
+Não há token, API ou serviço externo necessário para gerar os sprites.
 
 Abra `http://localhost:3000/`.
 

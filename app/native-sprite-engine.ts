@@ -17,6 +17,8 @@ type SpritePalette = {
   colors: RGB[];
 };
 
+const LOCAL_ATLAS_PATH = "/models/mobs-canonical-directions";
+
 const clampByte = (value: number) => Math.max(0, Math.min(255, Math.round(value)));
 
 function mix(color: RGB, target: RGB, amount: number): RGB {
@@ -329,4 +331,99 @@ export function generateNativeSpriteSet(
   return Object.fromEntries(
     directions.map((direction) => [direction, renderNativeDirection(direction, palette, outputSize)]),
   ) as Partial<Record<NativeSpriteDirection, string>>;
+}
+
+function placeNativeFrame(native: HTMLCanvasElement, outputSize: number) {
+  const output = document.createElement("canvas");
+  output.width = outputSize;
+  output.height = outputSize;
+  const context = output.getContext("2d");
+  if (!context) throw new Error("Canvas de exportação indisponível");
+  context.imageSmoothingEnabled = false;
+  const offsetX = Math.floor((outputSize - native.width) / 2);
+  const offsetY = Math.floor((outputSize - native.height) / 2);
+  context.drawImage(native, offsetX, offsetY);
+  return output.toDataURL("image/png");
+}
+
+function loadAtlasFrame(direction: NativeSpriteDirection) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error(`Falha ao carregar a vista local ${direction}`));
+    image.src = `${LOCAL_ATLAS_PATH}/${direction}.png`;
+  });
+}
+
+function applyReferencePalette(
+  context: CanvasRenderingContext2D,
+  sourcePalette: SpritePalette,
+  targetPalette: SpritePalette,
+) {
+  const frame = context.getImageData(0, 0, context.canvas.width, context.canvas.height);
+  for (let index = 0; index < frame.data.length; index += 4) {
+    if (frame.data[index + 3] < 54) {
+      frame.data[index + 3] = 0;
+      continue;
+    }
+    const source = {
+      red: frame.data[index],
+      green: frame.data[index + 1],
+      blue: frame.data[index + 2],
+    };
+    const paletteIndex = sourcePalette.colors.reduce(
+      (best, candidate, candidateIndex) => (
+        colorDistance(source, candidate) < colorDistance(source, sourcePalette.colors[best])
+          ? candidateIndex
+          : best
+      ),
+      0,
+    );
+    const color = targetPalette.colors[paletteIndex];
+    frame.data[index] = color.red;
+    frame.data[index + 1] = color.green;
+    frame.data[index + 2] = color.blue;
+    frame.data[index + 3] = 255;
+  }
+  context.putImageData(frame, 0, 0);
+}
+
+function palettesMatch(source: SpritePalette, target: SpritePalette) {
+  return source.colors.reduce(
+    (distance, color, index) => distance + colorDistance(color, target.colors[index]),
+    0,
+  ) < 1200;
+}
+
+/**
+ * Local MOB renderer. The user-authored eight-view atlas is the canonical 2D
+ * body rig. Matching references reuse it exactly; color variants transfer only
+ * palette indices and preserve every contour and anatomical pixel.
+ */
+export async function generateCanonicalMobSpriteSet(
+  image: HTMLImageElement,
+  directions: NativeSpriteDirection[],
+  outputSize = 256,
+) {
+  const targetPalette = extractPalette(image);
+  const nativeSize = Math.min(228, outputSize);
+  const generated: Partial<Record<NativeSpriteDirection, string>> = {};
+  for (const direction of directions) {
+    const atlasFrame = await loadAtlasFrame(direction);
+    const sourcePalette = extractPalette(atlasFrame);
+    if (nativeSize === atlasFrame.naturalWidth && palettesMatch(sourcePalette, targetPalette)) {
+      generated[direction] = atlasFrame.src;
+      continue;
+    }
+    const native = document.createElement("canvas");
+    native.width = nativeSize;
+    native.height = nativeSize;
+    const context = native.getContext("2d", { willReadFrequently: true });
+    if (!context) throw new Error("Canvas 2D indisponível");
+    context.imageSmoothingEnabled = false;
+    context.drawImage(atlasFrame, 0, 0, nativeSize, nativeSize);
+    applyReferencePalette(context, sourcePalette, targetPalette);
+    generated[direction] = placeNativeFrame(native, outputSize);
+  }
+  return generated;
 }

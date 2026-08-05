@@ -39,28 +39,27 @@ test("server-renders the Image to 3D studio", async () => {
   assert.match(html, /1, 2, 4 ou 8 direções/);
   assert.match(html, /não editável/);
   assert.match(html, /Quantidade de direções/);
-  assert.match(html, /IA multivista/);
-  assert.match(html, /qualidade PixelLab/);
-  assert.match(html, /Requer PIXELLAB_SECRET no servidor/);
+  assert.match(html, /Motor local MOB/);
+  assert.match(html, /8 vistas suas aprovadas · sem API/);
+  assert.match(html, /nenhuma imagem sai deste dispositivo/);
   assert.match(html, /Local experimental/);
   assert.match(html, /Exportar spritesheet PNG/);
   assert.match(html, /semantic anatomy v5/);
   assert.match(html, /Identidade em direções/);
-  assert.match(html, /modelo reconstrói anatomia, silhueta e sobreposição/);
+  assert.match(html, /suas vistas aprovadas controlam anatomia, silhueta e sobreposição/);
   assert.match(html, /Edição só no Pixel 3D/);
   assert.doesNotMatch(html, /Partes editáveis|Cor da parte|Selecione uma parte/);
   assert.doesNotMatch(html, /codex-preview|SkeletonPreview|react-loading-skeleton/i);
 });
 
 test("ships the canonical MOB example without coupling the tool to MOBs", async () => {
-  const [page, studio, layout, packageJson, example, submitRoute, pollRoute] = await Promise.all([
+  const [page, studio, layout, packageJson, example, rigMetadata] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/image-to-3d-studio.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../public/examples/mobs-base.png", import.meta.url)),
-    readFile(new URL("../app/api/pixel-character/jobs/route.ts", import.meta.url), "utf8"),
-    readFile(new URL("../app/api/pixel-character/jobs/[jobId]/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../public/models/mobs-canonical-directions/manifest.json", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /ImageTo3DStudio/);
@@ -70,8 +69,8 @@ test("ships the canonical MOB example without coupling the tool to MOBs", async 
   assert.match(studio, /DIRECTION_SETS\[directionCount\]/);
   assert.match(studio, /requestDirectionalGeneration/);
   assert.match(studio, /generateNativeSpriteSet/);
-  assert.match(studio, /spriteEngine === "ai-multiview"/);
-  assert.match(studio, /\/api\/pixel-character\/jobs/);
+  assert.match(studio, /spriteEngine === "canonical-local"/);
+  assert.match(studio, /generateCanonicalMobSpriteSet/);
   assert.match(studio, /downloadDirectionSheet/);
   assert.match(studio, /Exportar spritesheet PNG/);
   assert.doesNotMatch(studio, /aguardando conexão do motor de IA/);
@@ -95,11 +94,17 @@ test("ships the canonical MOB example without coupling the tool to MOBs", async 
   assert.match(studio, /inferSemanticSkeleton/);
   assert.match(studio, /buildAnatomyPrimitives/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
-  assert.match(submitRoute, /generate-8-rotations-v3/);
-  assert.match(submitRoute, /process\.env\.PIXELLAB_SECRET/);
-  assert.match(pollRoute, /background-jobs/);
-  assert.match(pollRoute, /normalizeImages/);
-  assert.doesNotMatch(studio, /process\.env\.PIXELLAB_SECRET/);
+  assert.doesNotMatch(studio, /PixelLab|PIXELLAB|\/api\/pixel-character/);
+  assert.match(rigMetadata, /"author": "0xddneto"/);
+
+  const manifest = JSON.parse(rigMetadata);
+  for (const [direction, expectedHash] of Object.entries(manifest.directions)) {
+    const frame = await readFile(
+      new URL(`../public/models/mobs-canonical-directions/${direction}.png`, import.meta.url),
+    );
+    const frameHash = createHash("sha256").update(frame).digest("hex").toUpperCase();
+    assert.equal(frameHash, expectedHash, `${direction} must remain byte-for-byte approved`);
+  }
 
   const hash = createHash("sha256").update(example).digest("hex").toUpperCase();
   assert.equal(hash, "67CA2D2A95DF8F79DF891CFB7D4494716615AB8D2AE5C657152D3B077C36319E");
@@ -109,6 +114,7 @@ test("ships the canonical MOB example without coupling the tool to MOBs", async 
   await access(new URL("../public/models/pose_landmarker_lite.task", import.meta.url));
   await access(new URL("../public/mediapipe/wasm/vision_wasm_internal.wasm", import.meta.url));
   await access(new URL("../app/native-sprite-engine.ts", import.meta.url));
-  await access(new URL("../.env.example", import.meta.url));
+  await access(new URL("../public/models/mobs-canonical-directions/south.png", import.meta.url));
+  await access(new URL("../public/models/mobs-canonical-directions/north.png", import.meta.url));
   await access(new URL(".openai/hosting.json", templateRoot));
 });

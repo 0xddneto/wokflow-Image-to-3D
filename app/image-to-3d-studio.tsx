@@ -35,14 +35,18 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
-import { generateNativeSpriteSet, type NativeSpriteDirection } from "./native-sprite-engine";
+import {
+  generateCanonicalMobSpriteSet,
+  generateNativeSpriteSet,
+  type NativeSpriteDirection,
+} from "./native-sprite-engine";
 
 type GenerationMode = "pixel" | "relief";
 type OutputMode = "pixel-character" | "pixel-3d";
 type DirectionCount = 1 | 2 | 4 | 8;
 type DirectionId = NativeSpriteDirection;
 type DirectionImageMap = Partial<Record<DirectionId, string>>;
-type SpriteEngine = "ai-multiview" | "local-experimental";
+type SpriteEngine = "canonical-local" | "local-experimental";
 type ViewName = "front" | "quarter" | "side";
 type PixelTool = "pencil" | "eraser" | "fill" | "eyedropper" | "box-select" | "wand" | "lasso" | "line" | "rectangle" | "circle";
 
@@ -206,28 +210,7 @@ const DIRECTION_SETS: Record<DirectionCount, DirectionId[]> = {
   8: DIRECTIONS.map((direction) => direction.id),
 };
 
-const SPRITE_FRAME_SIZE = 256;
-
-function wait(milliseconds: number) {
-  return new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
-}
-
-function prepareReferenceImage(image: HTMLImageElement) {
-  const scale = Math.min(1, 256 / Math.max(image.naturalWidth, image.naturalHeight));
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
-  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
-  const context = canvas.getContext("2d");
-  if (!context) throw new Error("Canvas de referência indisponível");
-  context.imageSmoothingEnabled = false;
-  context.drawImage(image, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL("image/png");
-}
-
-async function readApiError(response: Response) {
-  const body = await response.json().catch(() => null) as { error?: unknown } | null;
-  return typeof body?.error === "string" ? body.error : `Falha no motor de IA (${response.status})`;
-}
+const SPRITE_FRAME_SIZE = 228;
 
 function loadBrowserImage(source: string) {
   return new Promise<HTMLImageElement>((resolve, reject) => {
@@ -1007,8 +990,7 @@ export function ImageTo3DStudio() {
 
   const [outputMode, setOutputMode] = useState<OutputMode>("pixel-character");
   const [directionCount, setDirectionCount] = useState<DirectionCount>(8);
-  const [spriteEngine, setSpriteEngine] = useState<SpriteEngine>("ai-multiview");
-  const [spriteDescription, setSpriteDescription] = useState("humanoid pixel art character; preserve the exact body proportions, silhouette, palette and anatomy of the reference");
+  const [spriteEngine, setSpriteEngine] = useState<SpriteEngine>("canonical-local");
   const [mode, setMode] = useState<GenerationMode>("relief");
   const [resolution, setResolution] = useState(256);
   const [depth, setDepth] = useState(0.42);
@@ -1076,46 +1058,20 @@ export function ImageTo3DStudio() {
         setStatus(`${selectedDirections.length} sprites experimentais · este modo não reproduz a qualidade multivista da IA`);
         return;
       }
-
-      setStatus("Enviando a referência ao motor multivista…");
-      const submit = await fetch("/api/pixel-character/jobs", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          referenceImage: prepareReferenceImage(image),
-          description: spriteDescription,
-        }),
-      });
-      if (!submit.ok) throw new Error(await readApiError(submit));
-      const submitted = await submit.json() as { jobId?: string };
-      if (!submitted.jobId) throw new Error("O motor não devolveu um identificador de geração");
-
-      for (let attempt = 1; attempt <= 60; attempt += 1) {
-        setStatus(`IA reconstruindo anatomia e rotação · ${Math.min(attempt * 4, 240)}s`);
-        if (attempt > 1) await wait(4000);
-        const poll = await fetch(`/api/pixel-character/jobs/${encodeURIComponent(submitted.jobId)}`, {
-          cache: "no-store",
-        });
-        if (!poll.ok) throw new Error(await readApiError(poll));
-        const result = await poll.json() as {
-          status?: string;
-          error?: string;
-          images?: DirectionImageMap;
-        };
-        if (result.status === "failed") throw new Error(result.error ?? "A geração multivista falhou");
-        if (result.status !== "completed") continue;
-        if (!result.images) throw new Error("A geração terminou sem imagens");
-        setDirectionImages(result.images);
-        setStatus(`8 direções geradas por IA · exibindo ${selectedDirections.length} · 2D contínuo`);
-        return;
-      }
-      throw new Error("A geração excedeu quatro minutos. Tente consultar novamente.");
+      setStatus("Aplicando o rig 2D canônico e a paleta da referência…");
+      const generated = await generateCanonicalMobSpriteSet(
+        image,
+        selectedDirections.map((direction) => direction.id),
+        SPRITE_FRAME_SIZE,
+      );
+      setDirectionImages(generated);
+      setStatus(`${selectedDirections.length} sprites locais · rig 2D aprovado · sem API`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Falha ao gerar as direções");
     } finally {
       setGeneratingDirections(false);
     }
-  }, [directionCount, selectedDirections, spriteDescription, spriteEngine]);
+  }, [directionCount, selectedDirections, spriteEngine]);
 
   const downloadDirectionSheet = useCallback(async () => {
     const images = selectedDirections.map((direction) => directionImages[direction.id]);
@@ -2023,11 +1979,11 @@ export function ImageTo3DStudio() {
                 <button
                   type="button"
                   role="radio"
-                  aria-checked={spriteEngine === "ai-multiview"}
-                  className={spriteEngine === "ai-multiview" ? "is-active" : ""}
-                  onClick={() => setSpriteEngine("ai-multiview")}
+                  aria-checked={spriteEngine === "canonical-local"}
+                  className={spriteEngine === "canonical-local" ? "is-active" : ""}
+                  onClick={() => setSpriteEngine("canonical-local")}
                 >
-                  <Sparkles size={14} /><span><strong>IA multivista</strong><small>qualidade PixelLab · 8 vistas coerentes</small></span>
+                  <Sparkles size={14} /><span><strong>Motor local MOB</strong><small>8 vistas suas aprovadas · sem API</small></span>
                 </button>
                 <button
                   type="button"
@@ -2039,23 +1995,12 @@ export function ImageTo3DStudio() {
                   <Grid3X3 size={14} /><span><strong>Local experimental</strong><small>rápido · template simples</small></span>
                 </button>
               </div>
-              {spriteEngine === "ai-multiview" && (
-                <label className="sprite-description">
-                  <span>Descrição auxiliar</span>
-                  <textarea
-                    value={spriteDescription}
-                    maxLength={2000}
-                    rows={3}
-                    onChange={(event) => setSpriteDescription(event.target.value)}
-                  />
-                </label>
-              )}
               <button className="generate-direction-button" type="button" disabled={generatingDirections} onClick={requestDirectionalGeneration}>
                 <Sparkles size={15} /> {generatingDirections ? "Gerando…" : `Gerar ${directionCount} ${directionCount === 1 ? "direção" : "direções"}`}
               </button>
               <p className="engine-contract-note">
-                {spriteEngine === "ai-multiview"
-                  ? "A IA gera oito sprites 2D contínuos a partir da vista frontal; a interface mostra a quantidade escolhida. Requer PIXELLAB_SECRET no servidor."
+                {spriteEngine === "canonical-local"
+                  ? "As oito vistas 2D aprovadas são o rig canônico. A referência fornece a paleta; anatomia, contorno e pixels permanecem consistentes sem API externa."
                   : "Este template local serve apenas para testes de interface e não substitui um modelo generativo multivista."}
               </p>
             </>
@@ -2144,7 +2089,7 @@ export function ImageTo3DStudio() {
                     // eslint-disable-next-line @next/next/no-img-element
                     <img src={directionImages[direction.id]} alt={`Personagem em ${direction.label.toLowerCase()}`} />
                   ) : (
-                    <div className="direction-placeholder"><Sparkles size={18} /><span>{spriteEngine === "ai-multiview" ? "IA multivista" : "local experimental"}</span></div>
+                    <div className="direction-placeholder"><Sparkles size={18} /><span>{spriteEngine === "canonical-local" ? "motor local MOB" : "local experimental"}</span></div>
                   )}
                   <small>{directionImages[direction.id] ? "sprite 2D pronto" : "clique em gerar"}</small>
                 </article>
@@ -2211,7 +2156,7 @@ export function ImageTo3DStudio() {
                 <Download size={16} /> {exporting ? "Montando PNG…" : "Exportar spritesheet PNG"}
               </button>
               <p className="privacy-note">
-                <ShieldCheck size={14} /> A referência vai ao provedor somente no modo IA; a chave permanece protegida no servidor.
+                <ShieldCheck size={14} /> Geração e exportação executadas localmente; nenhuma imagem sai deste dispositivo.
               </p>
             </div>
           ) : (<>
@@ -2357,12 +2302,12 @@ export function ImageTo3DStudio() {
         <article className="workflow-step">
           <span>02 / MULTIVIEW</span>
           <h3>Identidade em direções</h3>
-          <p>O Pixel Character usa IA multivista para gerar oito sprites 2D coerentes. O Pixel 3D usa um pipeline separado.</p>
+          <p>O Pixel Character usa o rig 2D canônico aprovado em até oito direções coerentes. O Pixel 3D usa um pipeline separado.</p>
         </article>
         <article className="workflow-step">
           <span>03 / RECONSTRUCT</span>
           <h3>Corpo dividido</h3>
-          <p>No 2D, o modelo reconstrói anatomia, silhueta e sobreposição por direção. No 3D, pose e máscara posicionam volumes e profundidade.</p>
+          <p>No 2D, suas vistas aprovadas controlam anatomia, silhueta e sobreposição por direção. No 3D, pose e máscara posicionam volumes e profundidade.</p>
         </article>
         <article className="workflow-step">
           <span>04 / EDIT + SHIP</span>
